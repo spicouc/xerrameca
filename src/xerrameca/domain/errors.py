@@ -29,3 +29,7 @@ class LockedError(XerramecaError):
 
 class ValidationError(XerramecaError):
     status_code = 422
+
+
+class ProviderUnavailableError(XerramecaError):
+    status_code = 503
