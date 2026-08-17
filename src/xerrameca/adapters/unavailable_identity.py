@@ -7,13 +7,19 @@ from ..ports.identity import AgentIdentity
 class UnavailableIdentityAdapter:
     """Fail-closed provider used when no production identity adapter is configured."""
 
-    async def authenticate(self, agent_id: str, api_key: str) -> AgentIdentity:
+    async def authenticate(
+        self, api_key: str, *, agent_id_hint: str | None = None
+    ) -> AgentIdentity:
         raise ProviderUnavailableError("identity provider no configurat")
 
-    async def get_agent(self, agent_id: str) -> AgentIdentity:
+    async def get_agent(self, agent_id: str, *, credential: str) -> AgentIdentity:
         raise ProviderUnavailableError("identity provider no configurat")
 
     async def list_available_agents(
-        self, *, requester: AgentIdentity, scope: str
+        self,
+        *,
+        requester: AgentIdentity,
+        scope: str,
+        credential: str,
     ) -> list[AgentIdentity]:
         raise ProviderUnavailableError("identity provider no configurat")
