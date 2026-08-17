@@ -13,24 +13,41 @@ class InMemoryIdentityAdapter:
         self._identities = {identity.id: identity for identity in identities}
         self._api_keys = dict(api_keys)
 
-    async def authenticate(self, agent_id: str, api_key: str) -> AgentIdentity:
-        identity = self._identities.get(agent_id)
-        expected = self._api_keys.get(agent_id)
-        if not identity or not expected or not secrets.compare_digest(expected, api_key):
+    def _identity_for_key(self, api_key: str) -> AgentIdentity | None:
+        for agent_id, expected in self._api_keys.items():
+            if secrets.compare_digest(expected, api_key):
+                return self._identities.get(agent_id)
+        return None
+
+    async def authenticate(
+        self, api_key: str, *, agent_id_hint: str | None = None
+    ) -> AgentIdentity:
+        identity = self._identity_for_key(api_key)
+        if not identity:
             raise ForbiddenError("credencials invàlides")
+        if agent_id_hint is not None and identity.id != agent_id_hint:
+            raise ForbiddenError("X-Agent-ID no coincideix amb la credencial")
         if not identity.is_active:
             raise ForbiddenError("agent inactiu")
         return identity
 
-    async def get_agent(self, agent_id: str) -> AgentIdentity:
+    async def get_agent(self, agent_id: str, *, credential: str) -> AgentIdentity:
+        await self.authenticate(credential)
         identity = self._identities.get(agent_id)
         if not identity:
             raise NotFoundError("agent no trobat")
         return identity
 
     async def list_available_agents(
-        self, *, requester: AgentIdentity, scope: str
+        self,
+        *,
+        requester: AgentIdentity,
+        scope: str,
+        credential: str,
     ) -> list[AgentIdentity]:
+        authenticated = await self.authenticate(credential)
+        if authenticated.id != requester.id:
+            raise ForbiddenError("credencial no correspon al requester")
         return [
             identity
             for identity in self._identities.values()
