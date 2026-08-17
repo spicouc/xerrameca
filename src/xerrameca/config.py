@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     XERRAMECA_PORT: int = 8791
     XERRAMECA_DB_PATH: str = "/var/lib/xerrameca/xerrameca.db"
     XERRAMECA_IDENTITY_PROVIDER: Literal["unavailable", "pluribus"] = "unavailable"
+    XERRAMECA_SUMMARY_DISPATCH_SECONDS: float = 30.0
+    XERRAMECA_SUMMARY_MAX_ATTEMPTS: int = 10
     PLURIBUS_BASE_URL: str = "http://127.0.0.1:8790"
     PLURIBUS_TIMEOUT_SECONDS: float = 10.0
     # Optional integration-agent credential used only for deliberate Brain writes.
