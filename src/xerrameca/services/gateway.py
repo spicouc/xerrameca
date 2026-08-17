@@ -34,11 +34,21 @@ class XerramecaGateway:
         self.engine = engine
         self.identity = identity
 
-    async def authenticate(self, agent_id: str, api_key: str) -> AgentIdentity:
-        return await self.identity.authenticate(agent_id, api_key)
+    async def authenticate(
+        self, api_key: str, *, agent_id_hint: str | None = None
+    ) -> AgentIdentity:
+        return await self.identity.authenticate(api_key, agent_id_hint=agent_id_hint)
 
-    async def available_agents(self, caller: AgentIdentity, scope: str = "shared") -> list[dict[str, Any]]:
-        agents = await self.identity.list_available_agents(requester=caller, scope=scope)
+    async def available_agents(
+        self,
+        caller: AgentIdentity,
+        *,
+        credential: str,
+        scope: str = "shared",
+    ) -> list[dict[str, Any]]:
+        agents = await self.identity.list_available_agents(
+            requester=caller, scope=scope, credential=credential
+        )
         return [
             {
                 "id": agent.id,
@@ -50,8 +60,16 @@ class XerramecaGateway:
             if agent.id != caller.id and agent.is_active
         ]
 
-    async def _resolve_target(self, caller: AgentIdentity, token: str) -> AgentIdentity:
-        available = await self.identity.list_available_agents(requester=caller, scope="shared")
+    async def _resolve_target(
+        self,
+        caller: AgentIdentity,
+        token: str,
+        *,
+        credential: str,
+    ) -> AgentIdentity:
+        available = await self.identity.list_available_agents(
+            requester=caller, scope="shared", credential=credential
+        )
         candidates = [agent for agent in available if agent.id != caller.id and agent.is_active]
         by_id = [agent for agent in candidates if agent.id == token]
         if len(by_id) == 1:
@@ -118,7 +136,13 @@ class XerramecaGateway:
             raise ValidationError("objectiu buit")
         return target, objective, options
 
-    async def command(self, caller: AgentIdentity, raw_command: str) -> dict[str, Any]:
+    async def command(
+        self,
+        caller: AgentIdentity,
+        raw_command: str,
+        *,
+        credential: str,
+    ) -> dict[str, Any]:
         raw_command = (raw_command or "").strip()
         try:
             tokens = shlex.split(raw_command)
@@ -133,11 +157,17 @@ class XerramecaGateway:
         if verb == "agents":
             if len(tokens) > 2 or (len(tokens) == 2 and tokens[1].casefold() != "available"):
                 raise ValidationError("ús: /xerrameca agents [available]")
-            return {"action": "agents", "agents": await self.available_agents(caller)}
+            return {
+                "action": "agents",
+                "agents": await self.available_agents(caller, credential=credential),
+            }
         if verb == "status":
             if len(tokens) != 1:
                 raise ValidationError("ús: /xerrameca status")
-            return {"action": "status", "conversations": await self.engine.list_conversations(caller)}
+            return {
+                "action": "status",
+                "conversations": await self.engine.list_conversations(caller),
+            }
         if verb == "stop":
             if len(tokens) != 2:
                 raise ValidationError("ús: /xerrameca stop <conversation_id>")
@@ -150,7 +180,9 @@ class XerramecaGateway:
             }
 
         target_token, objective, options = self._parse_start(tokens)
-        target = await self._resolve_target(caller, target_token)
+        target = await self._resolve_target(
+            caller, target_token, credential=credential
+        )
         supervisor = caller.id if options.pop("supervisor") else None
         body = ConversationCreateRequest(
             name=f"{caller.name} ↔ {target.name}",
@@ -177,5 +209,7 @@ class XerramecaGateway:
     async def claim(self, caller: AgentIdentity, turn_id: str) -> dict[str, Any]:
         return await self.engine.claim_turn(caller, turn_id)
 
-    async def reply(self, caller: AgentIdentity, turn_id: str, body: ReplyRequest) -> dict[str, Any]:
+    async def reply(
+        self, caller: AgentIdentity, turn_id: str, body: ReplyRequest
+    ) -> dict[str, Any]:
         return await self.engine.reply_turn(caller, turn_id, body)
