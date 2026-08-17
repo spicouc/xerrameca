@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .adapters.pluribus_identity import PluribusIdentityAdapter
 from .adapters.unavailable_identity import UnavailableIdentityAdapter
 from .api.rest import router as xerrameca_router
 from .config import settings
@@ -15,13 +16,22 @@ from .services.engine import ConversationEngine
 from .services.gateway import XerramecaGateway
 
 
+def _configured_identity_provider() -> IdentityPort:
+    if settings.XERRAMECA_IDENTITY_PROVIDER == "pluribus":
+        return PluribusIdentityAdapter(
+            settings.PLURIBUS_BASE_URL,
+            timeout_seconds=settings.PLURIBUS_TIMEOUT_SECONDS,
+        )
+    return UnavailableIdentityAdapter()
+
+
 def create_app(
     *,
     identity: IdentityPort | None = None,
     db_path: str | None = None,
 ) -> FastAPI:
     engine = ConversationEngine(db_path or settings.XERRAMECA_DB_PATH)
-    gateway = XerramecaGateway(engine, identity or UnavailableIdentityAdapter())
+    gateway = XerramecaGateway(engine, identity or _configured_identity_provider())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -49,6 +59,7 @@ def create_app(
             "status": "ok",
             "service": "xerrameca",
             "version": __version__,
+            "identity_provider": settings.XERRAMECA_IDENTITY_PROVIDER,
         }
 
     app.include_router(xerrameca_router)

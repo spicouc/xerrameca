@@ -19,30 +19,34 @@ class CommandRequest(BaseModel):
 
 async def _caller(
     request: Request,
-    agent_id: Annotated[str, Header(alias="X-Agent-ID")],
-    api_key: Annotated[str, Header(alias="X-API-Key")],
+    api_key: str,
+    agent_id_hint: str | None,
 ) -> AgentIdentity:
-    return await request.app.state.gateway.authenticate(agent_id, api_key)
+    return await request.app.state.gateway.authenticate(
+        api_key, agent_id_hint=agent_id_hint
+    )
 
 
 @router.post("/command")
 async def command(
     body: CommandRequest,
     request: Request,
-    agent_id: Annotated[str, Header(alias="X-Agent-ID")],
     api_key: Annotated[str, Header(alias="X-API-Key")],
+    agent_id_hint: Annotated[str | None, Header(alias="X-Agent-ID")] = None,
 ) -> dict[str, Any]:
-    caller = await _caller(request, agent_id, api_key)
-    return await request.app.state.gateway.command(caller, body.command)
+    caller = await _caller(request, api_key, agent_id_hint)
+    return await request.app.state.gateway.command(
+        caller, body.command, credential=api_key
+    )
 
 
 @router.get("/inbox")
 async def inbox(
     request: Request,
-    agent_id: Annotated[str, Header(alias="X-Agent-ID")],
     api_key: Annotated[str, Header(alias="X-API-Key")],
+    agent_id_hint: Annotated[str | None, Header(alias="X-Agent-ID")] = None,
 ) -> dict[str, Any]:
-    caller = await _caller(request, agent_id, api_key)
+    caller = await _caller(request, api_key, agent_id_hint)
     return await request.app.state.gateway.inbox(caller)
 
 
@@ -50,10 +54,10 @@ async def inbox(
 async def claim(
     turn_id: str,
     request: Request,
-    agent_id: Annotated[str, Header(alias="X-Agent-ID")],
     api_key: Annotated[str, Header(alias="X-API-Key")],
+    agent_id_hint: Annotated[str | None, Header(alias="X-Agent-ID")] = None,
 ) -> dict[str, Any]:
-    caller = await _caller(request, agent_id, api_key)
+    caller = await _caller(request, api_key, agent_id_hint)
     return await request.app.state.gateway.claim(caller, turn_id)
 
 
@@ -62,20 +66,20 @@ async def reply(
     turn_id: str,
     body: ReplyRequest,
     request: Request,
-    agent_id: Annotated[str, Header(alias="X-Agent-ID")],
     api_key: Annotated[str, Header(alias="X-API-Key")],
+    agent_id_hint: Annotated[str | None, Header(alias="X-Agent-ID")] = None,
 ) -> dict[str, Any]:
-    caller = await _caller(request, agent_id, api_key)
+    caller = await _caller(request, api_key, agent_id_hint)
     return await request.app.state.gateway.reply(caller, turn_id, body)
 
 
 @router.get("/conversations")
 async def conversations(
     request: Request,
-    agent_id: Annotated[str, Header(alias="X-Agent-ID")],
     api_key: Annotated[str, Header(alias="X-API-Key")],
+    agent_id_hint: Annotated[str | None, Header(alias="X-Agent-ID")] = None,
 ) -> list[dict[str, Any]]:
-    caller = await _caller(request, agent_id, api_key)
+    caller = await _caller(request, api_key, agent_id_hint)
     return await request.app.state.gateway.engine.list_conversations(caller)
 
 
@@ -83,19 +87,23 @@ async def conversations(
 async def conversation(
     conversation_id: str,
     request: Request,
-    agent_id: Annotated[str, Header(alias="X-Agent-ID")],
     api_key: Annotated[str, Header(alias="X-API-Key")],
+    agent_id_hint: Annotated[str | None, Header(alias="X-Agent-ID")] = None,
 ) -> dict[str, Any]:
-    caller = await _caller(request, agent_id, api_key)
-    return await request.app.state.gateway.engine.get_conversation(caller, conversation_id)
+    caller = await _caller(request, api_key, agent_id_hint)
+    return await request.app.state.gateway.engine.get_conversation(
+        caller, conversation_id
+    )
 
 
 @router.get("/conversations/{conversation_id}/messages")
 async def messages(
     conversation_id: str,
     request: Request,
-    agent_id: Annotated[str, Header(alias="X-Agent-ID")],
     api_key: Annotated[str, Header(alias="X-API-Key")],
+    agent_id_hint: Annotated[str | None, Header(alias="X-Agent-ID")] = None,
 ) -> list[dict[str, Any]]:
-    caller = await _caller(request, agent_id, api_key)
-    return await request.app.state.gateway.engine.list_messages(caller, conversation_id)
+    caller = await _caller(request, api_key, agent_id_hint)
+    return await request.app.state.gateway.engine.list_messages(
+        caller, conversation_id
+    )
