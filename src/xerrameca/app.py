@@ -10,6 +10,7 @@ from . import __version__
 from .adapters.pluribus_identity import PluribusIdentityAdapter
 from .adapters.pluribus_memory import PluribusMemoryAdapter
 from .adapters.unavailable_identity import UnavailableIdentityAdapter
+from .api.mcp import router as mcp_router
 from .api.rest import router as xerrameca_router
 from .config import settings
 from .domain.errors import XerramecaError
@@ -101,6 +102,7 @@ def create_app(
             "summary_dispatcher": dispatcher is not None,
         }
 
+    app.include_router(mcp_router)
     app.include_router(xerrameca_router)
     return app
 
