@@ -11,6 +11,7 @@ from .adapters.pluribus_identity import PluribusIdentityAdapter
 from .adapters.pluribus_memory import PluribusMemoryAdapter
 from .adapters.unavailable_identity import UnavailableIdentityAdapter
 from .api.mcp import router as mcp_router
+from .api.monitor import router as monitor_router
 from .api.rest import router as xerrameca_router
 from .config import settings
 from .domain.errors import XerramecaError
@@ -18,6 +19,7 @@ from .ports.identity import IdentityPort
 from .ports.memory import MemoryPort
 from .services.engine import ConversationEngine
 from .services.gateway import XerramecaGateway
+from .services.monitor import PassiveMonitor
 from .services.summary_dispatcher import SummaryDispatcher
 
 
@@ -48,6 +50,7 @@ def create_app(
 ) -> FastAPI:
     engine = ConversationEngine(db_path or settings.XERRAMECA_DB_PATH)
     gateway = XerramecaGateway(engine, identity or _configured_identity_provider())
+    monitor = PassiveMonitor(engine.db_path)
     memory_provider = memory or _configured_memory_provider()
     dispatcher = (
         SummaryDispatcher(
@@ -84,6 +87,7 @@ def create_app(
     )
     app.state.engine = engine
     app.state.gateway = gateway
+    app.state.monitor = monitor
     app.state.summary_dispatcher = dispatcher
 
     @app.exception_handler(XerramecaError)
@@ -100,9 +104,11 @@ def create_app(
             "version": __version__,
             "identity_provider": settings.XERRAMECA_IDENTITY_PROVIDER,
             "summary_dispatcher": dispatcher is not None,
+            "passive_monitor": True,
         }
 
     app.include_router(mcp_router)
+    app.include_router(monitor_router)
     app.include_router(xerrameca_router)
     return app
 
