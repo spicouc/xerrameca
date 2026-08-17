@@ -1,0 +1,30 @@
+[Unit]
+Description=Xerrameca standalone agent-to-agent orchestration service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xerrameca
+Group=xerrameca
+WorkingDirectory=/opt/xerrameca
+EnvironmentFile=/etc/xerrameca/xerrameca.env
+ExecStart=/opt/xerrameca/venv/bin/uvicorn xerrameca.app:app --host 0.0.0.0 --port 8791 --workers 1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xerrameca
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
