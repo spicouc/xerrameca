@@ -82,8 +82,8 @@ def test_tampered_invite_signature_is_rejected(tmp_path: Path) -> None:
     a_dir, _, _, _ = _nodes(tmp_path)
     token = create_invite(a_dir, ttl_seconds=600)
     payload, signature = token.split(".", 1)
-    replacement = "A" if signature[-1] != "A" else "B"
-    tampered = payload + "." + signature[:-1] + replacement
+    replacement = "A" if signature[0] != "A" else "B"
+    tampered = payload + "." + replacement + signature[1:]
     with pytest.raises(ForbiddenError):
         verify_invite(tampered)
 
