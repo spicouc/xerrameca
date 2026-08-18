@@ -28,6 +28,8 @@ jobs:
         run: |
           mapfile -t baseline_tests < tests/baseline_regressions.txt
           pytest -q "${baseline_tests[@]}"
+      - name: X13 federated chaos gate
+        run: pytest -q tests/test_chaos_federated.py
       - name: Test
         run: pytest -q
       - name: Build standalone container
