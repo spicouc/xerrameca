@@ -94,33 +94,39 @@ def test_expired_coordinator_self_fences_before_peer_takeover(tmp_path: Path) ->
     base_a = FederatedDialogueService(a_dir)
     view = base_a.create(b.node_id, objective="Safe failover", delay_seconds=0)
     cid = view.id
+    base_time = int(view.current_turn["available_at"])
     manager_a = FailoverManager(a_dir)
-    manager_a.grant_initial_lease(cid, lease_seconds=15, now=100)
+    manager_a.grant_initial_lease(cid, lease_seconds=15, now=base_time)
 
     _replicate_epoch(a_dir, b_dir, a.node_id, cid, 1)
     head_a = EventStore(a_dir).get_head(cid)
     EventStore(a_dir).ack(b.node_id, cid, 1, head_a.last_sequence)
 
     leased_a = LeasedDialogueService(a_dir)
-    leased_a.claim(cid, claimant_node_id=a.node_id, expected_epoch=1, now=101)
+    leased_a.claim(
+        cid,
+        claimant_node_id=a.node_id,
+        expected_epoch=1,
+        now=base_time + 1,
+    )
     leased_a.reply(
         cid,
         author_node_id=a.node_id,
         content="A hands the next turn to B.",
         result="continue",
         expected_epoch=1,
-        now=101,
+        now=base_time + 1,
     )
     _replicate_epoch(a_dir, b_dir, a.node_id, cid, 1)
 
     with pytest.raises(ConflictError, match="coordinator lease expired"):
-        manager_a.require_local_write_lease(cid, now=116)
+        manager_a.require_local_write_lease(cid, now=base_time + 16)
 
     manager_b = FailoverManager(b_dir)
     actions = asyncio.run(
         manager_b.tick(
             None,
-            now=121,
+            now=base_time + 21,
             lease_seconds=15,
             renew_before_seconds=5,
             grace_seconds=5,
@@ -129,21 +135,26 @@ def test_expired_coordinator_self_fences_before_peer_takeover(tmp_path: Path) ->
     takeover = next(action for action in actions if action["action"] == "takeover")
     assert takeover["epoch"] == 2
 
-    status_b = manager_b.status(cid, now=121)
+    status_b = manager_b.status(cid, now=base_time + 21)
     assert status_b.coordinator_id == b.node_id
     assert status_b.coordinator_epoch == 2
     assert status_b.takeover_grant is True
     assert status_b.expired is False
 
     leased_b = LeasedDialogueService(b_dir)
-    leased_b.claim(cid, claimant_node_id=b.node_id, expected_epoch=2, now=121)
+    leased_b.claim(
+        cid,
+        claimant_node_id=b.node_id,
+        expected_epoch=2,
+        now=base_time + 21,
+    )
     progressed = leased_b.reply(
         cid,
         author_node_id=b.node_id,
         content="B continues under epoch 2.",
         result="continue",
         expected_epoch=2,
-        now=121,
+        now=base_time + 21,
     )
     assert progressed.coordinator_id == b.node_id
     assert progressed.coordinator_epoch == 2
@@ -158,7 +169,7 @@ def test_expired_coordinator_self_fences_before_peer_takeover(tmp_path: Path) ->
             cid,
             claimant_node_id=a.node_id,
             expected_epoch=2,
-            now=122,
+            now=base_time + 22,
         )
 
     history_a = [event.to_dict() for event in EventStore(a_dir).list_events(cid)]
