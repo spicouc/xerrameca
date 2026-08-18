@@ -1,0 +1,8 @@
+tests/test_health.py
+tests/test_engine.py
+tests/test_rest_contract.py
+tests/test_mcp_contract.py
+tests/test_api_key_only.py
+tests/test_pluribus_adapters.py
+tests/test_summary_dispatcher.py
+tests/test_monitor.py
