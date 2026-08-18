@@ -24,6 +24,10 @@ jobs:
             echo 'Direct pluribus.* imports are forbidden in Xerrameca.'
             exit 1
           fi
+      - name: X5-X8 baseline contract
+        run: |
+          mapfile -t baseline_tests < tests/baseline_regressions.txt
+          pytest -q "${baseline_tests[@]}"
       - name: Test
         run: pytest -q
       - name: Build standalone container
