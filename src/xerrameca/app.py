@@ -50,11 +50,13 @@ def create_app(
     identity: IdentityPort | None = None,
     memory: MemoryPort | None = None,
     db_path: str | None = None,
+    identity_provider_name: str | None = None,
 ) -> FastAPI:
     engine = ConversationEngine(db_path or settings.XERRAMECA_DB_PATH)
     gateway = XerramecaGateway(engine, identity or _configured_identity_provider())
     monitor = PassiveMonitor(engine.db_path)
     memory_provider = memory or _configured_memory_provider()
+    provider_name = identity_provider_name or settings.XERRAMECA_IDENTITY_PROVIDER
     dispatcher = (
         SummaryDispatcher(
             engine.db_path,
@@ -105,7 +107,7 @@ def create_app(
             "status": "ok",
             "service": "xerrameca",
             "version": __version__,
-            "identity_provider": settings.XERRAMECA_IDENTITY_PROVIDER,
+            "identity_provider": provider_name,
             "summary_dispatcher": dispatcher is not None,
             "passive_monitor": True,
         }
