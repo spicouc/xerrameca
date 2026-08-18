@@ -156,24 +156,48 @@ Do not roll back only code after an incompatible schema migration without restor
 
 ## 10. Real two-host release gate
 
-Stable v1 requires a real network smoke on two independent hosts with Pluribus stopped/unreachable:
+Stable v1 requires a real network smoke on two independent hosts with Pluribus stopped/unreachable.
+
+The repository already provides:
 
 ```text
-Node A init/start
-Node B init/start
-A/B trust
+scripts/smoke_federated_two_node.py
+```
+
+It reads credentials only from runtime environment variables and never prints their values:
+
+```text
+XERRAMECA_NODE_A_URL
+XERRAMECA_NODE_B_URL
+XERRAMECA_NODE_A_KEY
+XERRAMECA_NODE_B_KEY
+XERRAMECA_NODE_B_ID
+```
+
+With both nodes already initialized, running and mutually trusted, execute the smoke from a trusted shell/process environment. Do not place key values in shell history, issue comments or CI logs.
+
+The script certifies the real network path for:
+
+```text
+health A/B
 A creates conversation
-A replies
-B claims/replies
-completion proposal
-other node confirms completion
-both histories identical
-restart B
-B identity unchanged
+A claim/reply
+B observes replication
+B claim/reply + completion proposal
+A completion confirmation
+B convergence / explicit catch-up if needed
+final logical views equal
+```
+
+The full stable-v1 physical gate additionally requires:
+
+```text
+restart one node
+node identity unchanged
 bounded catch-up PASS
-coordinator failover test PASS
+coordinator failover/rejoin PASS
 PRAGMA quick_check both DBs = ok
-Pluribus contacted = NO
+Pluribus stopped/unreachable throughout
 ```
 
 Record only node ids, conversation id, commit/package version and PASS/FAIL evidence. Never copy local API keys, private keys or invite tokens into the certification report.
