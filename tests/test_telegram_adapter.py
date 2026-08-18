@@ -7,7 +7,7 @@ import pytest
 
 from xerrameca.integrations.telegram import TelegramMode, TelegramUXAdapter
 from xerrameca.node.app import create_node_app
-from xerrameca.node.identity import initialize_node
+from xerrameca.node.identity import LOCAL_API_KEY_FILENAME, initialize_node
 from xerrameca.node.trust import (
     accept_incoming,
     build_acceptance,
@@ -50,7 +50,7 @@ def _trusted_nodes(tmp_path: Path):
 async def test_telegram_adapter_starts_and_follows_real_node_conversation(tmp_path: Path) -> None:
     a_dir, _, _, b = _trusted_nodes(tmp_path)
     app = create_node_app(str(a_dir))
-    api_key = (a_dir / "local-api-key").read_text(encoding="utf-8").strip()
+    api_key = (a_dir / LOCAL_API_KEY_FILENAME).read_text(encoding="utf-8").strip()
     transport = FakeTelegramTransport()
 
     async with httpx.AsyncClient(
@@ -85,7 +85,7 @@ async def test_telegram_adapter_starts_and_follows_real_node_conversation(tmp_pa
 async def test_silent_summary_live_modes_do_not_change_runtime_state(tmp_path: Path) -> None:
     a_dir, _, _, b = _trusted_nodes(tmp_path)
     app = create_node_app(str(a_dir))
-    api_key = (a_dir / "local-api-key").read_text(encoding="utf-8").strip()
+    api_key = (a_dir / LOCAL_API_KEY_FILENAME).read_text(encoding="utf-8").strip()
     transport = FakeTelegramTransport()
 
     async with httpx.AsyncClient(
