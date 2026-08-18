@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -8,8 +10,8 @@ from fastapi import FastAPI, Request
 from ..adapters.local_identity import LocalIdentityAdapter
 from ..app import create_app
 from ..domain.errors import ForbiddenError, ProviderUnavailableError, ValidationError
-from .dialogue import FederatedDialogueService
 from .dialogue_transport import RemoteDialogueClient
+from .failover import DEFAULT_LEASE_SECONDS, LeasedDialogueService
 from .identity import NodeState, load_node_state
 from .replication import ReplicationService
 from .trust import PeerRecord, accept_incoming, verify_peer_request
@@ -26,11 +28,29 @@ def create_node_app(state_dir: str) -> FastAPI:
         identity_provider_name="local-node",
     )
     replication = ReplicationService(state.state_dir)
-    dialogue = FederatedDialogueService(state.state_dir)
+    dialogue = LeasedDialogueService(state.state_dir)
+    failover = dialogue.failover
     remote_dialogue = RemoteDialogueClient(state.state_dir)
     app.state.node_state = state
     app.state.replication_service = replication
     app.state.federated_dialogue = dialogue
+    app.state.failover_manager = failover
+
+    # Add the X12 local failover loop without replacing the base application's
+    # database/summary-dispatcher lifespan.
+    base_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def node_lifespan(node_app: FastAPI):
+        async with base_lifespan(node_app):
+            failover_task = asyncio.create_task(failover.loop(replication))
+            try:
+                yield
+            finally:
+                failover_task.cancel()
+                await asyncio.gather(failover_task, return_exceptions=True)
+
+    app.router.lifespan_context = node_lifespan
 
     async def authenticate_peer(request: Request, body: bytes) -> PeerRecord:
         node_id = request.headers.get("X-Xerrameca-Node")
@@ -73,8 +93,6 @@ def create_node_app(state_dir: str) -> FastAPI:
             )
             return "synced"
         except ProviderUnavailableError:
-            # Local authoritative events stay committed. The ACK cursor remains
-            # behind and a later sync/retry sends the missing range.
             return "pending"
 
     @app.get("/v1/node/identity", tags=["node"])
@@ -170,8 +188,14 @@ def create_node_app(state_dir: str) -> FastAPI:
             turn_timeout_seconds=int(body.get("turn_timeout_seconds", 300)),
             delay_seconds=int(body.get("delay_seconds", 0)),
         )
+        lease_seconds = int(body.get("coordinator_lease_seconds", DEFAULT_LEASE_SECONDS))
+        if lease_seconds > 0:
+            failover.grant_initial_lease(view.id, lease_seconds=lease_seconds)
+            view = dialogue.get(view.id)
         payload = view.to_dict()
         payload["replication_status"] = await best_effort_push(payload)
+        if lease_seconds > 0:
+            payload["coordinator_lease"] = failover.status(view.id).to_dict()
         return payload
 
     @app.get(
@@ -182,7 +206,11 @@ def create_node_app(state_dir: str) -> FastAPI:
         conversation_id: str, request: Request
     ) -> dict[str, Any]:
         await authenticate_local_agent(request)
-        return dialogue.get(conversation_id).to_dict()
+        payload = dialogue.get(conversation_id).to_dict()
+        lease = failover.status(conversation_id)
+        if lease.enabled:
+            payload["coordinator_lease"] = lease.to_dict()
+        return payload
 
     @app.post(
         "/v1/node/federation/conversations/{conversation_id}/claim",
@@ -346,6 +374,60 @@ def create_node_app(state_dir: str) -> FastAPI:
         return {
             "conversation": view.to_dict(),
             "events": [event.to_dict() for event in events],
+        }
+
+    # ------------------------------------------------------------------
+    # X12 coordinator lease/failover control and observability.
+    # ------------------------------------------------------------------
+
+    @app.post("/v1/node/failover/tick", tags=["failover"])
+    async def failover_tick(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        await authenticate_local_agent(request)
+        actions = await failover.tick(
+            replication,
+            lease_seconds=int(body.get("lease_seconds", DEFAULT_LEASE_SECONDS)),
+            renew_before_seconds=int(body.get("renew_before_seconds", 40)),
+            grace_seconds=int(body.get("grace_seconds", 5)),
+        )
+        return {"actions": actions}
+
+    @app.get("/v1/node/failover/{conversation_id}", tags=["failover"])
+    async def failover_status(conversation_id: str, request: Request) -> dict[str, Any]:
+        await authenticate_local_agent(request)
+        return failover.status(conversation_id).to_dict()
+
+    @app.post("/v1/node/failover/{conversation_id}/renew", tags=["failover"])
+    async def failover_renew(
+        conversation_id: str, request: Request, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        await authenticate_local_agent(request)
+        failover.renew_lease(
+            conversation_id,
+            lease_seconds=int(body.get("lease_seconds", DEFAULT_LEASE_SECONDS)),
+        )
+        view = dialogue.get(conversation_id).to_dict()
+        replication_status = await best_effort_push(view)
+        return {
+            "lease": failover.status(conversation_id).to_dict(),
+            "replication_status": replication_status,
+        }
+
+    @app.post("/v1/node/failover/{conversation_id}/takeover", tags=["failover"])
+    async def failover_takeover(
+        conversation_id: str, request: Request, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        await authenticate_local_agent(request)
+        takeover = failover.takeover(
+            conversation_id,
+            lease_seconds=int(body.get("lease_seconds", DEFAULT_LEASE_SECONDS)),
+            grace_seconds=int(body.get("grace_seconds", 5)),
+        )
+        view = dialogue.get(conversation_id).to_dict()
+        replication_status = await best_effort_push(view)
+        return {
+            "lease": takeover.to_dict(),
+            "conversation": view,
+            "replication_status": replication_status,
         }
 
     return app
