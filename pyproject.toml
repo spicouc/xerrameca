@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xerrameca"
-version = "0.1.0-dev0"
-description = "Independent agent-to-agent orchestration service"
+version = "1.0.0rc1"
+description = "Independent federated agent-to-agent orchestration runtime"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}

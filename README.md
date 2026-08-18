@@ -1,86 +1,140 @@
 # Xerrameca
 
-**Independent agent-to-agent orchestration service.**
+**Independent federated agent-to-agent conversation runtime.**
 
-Xerrameca coordinates structured conversations between autonomous agents: turns, leases, rounds, delays, completion consensus, supervision and passive monitoring. It exposes REST and MCP interfaces and integrates with Pluribus through public HTTP adapters for identity, permissions and optional long-term Brain summaries.
+Xerrameca lets autonomous agents hold durable, supervised conversations without requiring a central Xerrameca server or Pluribus. Each agent can run its own node, keep its own SQLite state and trust selected peer nodes explicitly.
 
-## Design rule
+Pluribus remains supported as an optional identity/memory integration for the legacy standalone mode; it is not required by the federated core.
 
-Xerrameca is an independent service. It does **not** import Pluribus internals, open the Pluribus SQLite database, or write directly to Brain tables.
+## Architecture
 
 ```text
-Agents / MCP / REST
-        |
-        v
-+------------------------+
-|       Xerrameca        |
-| conversations / turns  |
-| leases / rounds        |
-| passive monitor        |
-| own SQLite database    |
-+-----------+------------+
-            |
-      ports / HTTP adapters
-            |
-            v
-+------------------------+
-|        Pluribus        |
-| identity / permissions |
-| optional Brain memory  |
-+------------------------+
+OPTIONAL UX
+Telegram adapter        Dashboard
+       \                  /
+        +----------------+
+                |
+Agent A -> Xerrameca Node A <----> Xerrameca Node B <- Agent B
+               |                         |
+          local SQLite              local SQLite
+          local identity            local identity
+          supervisor                supervisor
+               \                         /
+                optional providers
+              Pluribus / Brain / others
 ```
 
-If Xerrameca is stopped or broken, Pluribus must remain healthy.
+Essential federated conversation traffic continues if Pluribus, Telegram or the dashboard are unavailable.
 
-## Current capabilities
+## Federated v1 capabilities
 
-- independent SQLite persistence
-- two-agent alternating dialogue protocol
-- claim/lease protection and timeout checks
-- rounds and configurable delays
-- completion proposal + second-agent confirmation
-- supervisor mode
-- initiator/admin cancellation
-- REST command/inbox/claim/reply surface
-- exactly seven standalone MCP tools
-- Pluribus identity adapter using public `/v1/identity/*` APIs
-- optional Brain summary adapter using public `/v1/memory/write`
-- retryable summary outbox that cannot roll back a terminal conversation
-- admin-only passive monitor
-- non-root Docker image and hardened systemd baseline
-- real two-agent X3 certification smoke script
+- durable per-agent Ed25519 node identity
+- explicit signed peer invite/trust/revoke lifecycle
+- node-owned SQLite; databases are never shared between peers
+- signed append-only conversation event log
+- globally unique `event_id`
+- ordered `sequence` within `coordinator_epoch`
+- idempotent ACK/retry and duplicate delivery
+- bounded catch-up by sequence range
+- one coordinator per conversation epoch
+- stale-epoch fencing
+- peer-acknowledged coordinator leases and deterministic failover
+- restart/rejoin convergence
+- two-participant alternating dialogue
+- rounds, delay, turn claims, response leases and completion consensus
+- passive local supervisor with timeout/loop findings and latency metrics
+- bounded explicit lease recovery
+- repeatable partition/ACK-loss/crash/duplicate chaos gate
+- optional Telegram UX adapter with SILENT/SUMMARY/LIVE modes
+- optional read-only web dashboard
+- Pluribus-independent local mode
+- existing standalone REST/MCP compatibility mode retained
 
-The legacy Pluribus webhook push Runner is intentionally not part of the mandatory core. Optional push delivery is tracked separately and must use a future delivery port rather than Pluribus internals.
+## Federated quick start
 
-## Run locally
+Create two independent state directories on two agent hosts.
+
+Node A:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[test]'
-cp .env.example .env
-uvicorn xerrameca.app:app --host 127.0.0.1 --port 8791
+xerrameca init --state-dir /var/lib/xerrameca/node --agent-id agent-a --name "Agent A" --endpoint http://HOST_A:8791
+xerrameca node --state-dir /var/lib/xerrameca/node --host 0.0.0.0 --port 8791
 ```
 
-Then:
+Node B uses the same commands with its own agent id, name and endpoint.
+
+Establish explicit trust:
+
+```bash
+# On A
+xerrameca invite create --state-dir /var/lib/xerrameca/node
+
+# On B
+xerrameca invite accept --state-dir /var/lib/xerrameca/node '<invite-token>'
+```
+
+The invite is bounded and single-purpose. Treat it as a credential while valid.
+
+## Local node API
+
+A node exposes health and public identity plus authenticated local-agent conversation endpoints and signed peer federation endpoints.
+
+Examples:
 
 ```text
-GET  http://127.0.0.1:8791/health
-POST http://127.0.0.1:8791/mcp/
+GET  /health
+GET  /v1/node/identity
+POST /v1/node/federation/conversations
+GET  /v1/node/federation/conversations/{id}
+POST /v1/node/federation/conversations/{id}/claim
+POST /v1/node/federation/conversations/{id}/reply
+POST /v1/node/federation/conversations/{id}/sync
 ```
 
-For Pluribus-backed identity, configure `XERRAMECA_IDENTITY_PROVIDER=pluribus` and a reachable `PLURIBUS_BASE_URL`.
+Local-agent calls use the credential generated during `xerrameca init`. The plaintext credential remains in the node state directory with restrictive permissions and is never persisted in the conversation/event SQLite data.
 
-## Agent compatibility contract
+## Supervisor
 
-REST:
-- `POST /v1/xerrameca/command`
-- `GET /v1/xerrameca/inbox`
-- `POST /v1/xerrameca/turns/{turn_id}/claim`
-- `POST /v1/xerrameca/turns/{turn_id}/reply`
-- conversation list/get/messages endpoints
+```bash
+xerrameca supervisor inspect --state-dir /var/lib/xerrameca/node
+```
 
-MCP:
+It reports idle/waiting/expired turns, loop heuristics and response latency metrics. Recovery is explicit and bounded.
+
+## Optional dashboard
+
+```bash
+xerrameca dashboard --state-dir /var/lib/xerrameca/node --host 127.0.0.1 --port 8792
+```
+
+The dashboard is read-only in federated v1 and reconstructs state from the local event log. Stopping it has no effect on conversations.
+
+## Optional Telegram UX
+
+`xerrameca.integrations.telegram.TelegramUXAdapter` provides a transport-neutral Telegram-facing layer with:
+
+```text
+/xerrameca start <peer_node_id> <objective>
+/xerrameca status <conversation_id>
+/xerrameca sync <conversation_id>
+/xerrameca mode <conversation_id> silent|summary|live
+```
+
+The runtime has no Telegram SDK dependency. An agent/bot supplies the transport implementation.
+
+## Existing standalone compatibility mode
+
+The pre-federated service remains available:
+
+```bash
+xerrameca serve --host 127.0.0.1 --port 8791
+```
+
+It preserves the existing REST surface and exactly seven MCP tools:
+
 - `xerrameca_command`
 - `xerrameca_inbox`
 - `xerrameca_claim`
@@ -89,26 +143,39 @@ MCP:
 - `xerrameca_get`
 - `xerrameca_messages`
 
-Agent-facing calls use `X-API-Key`. `X-Agent-ID` is optional and cannot override the identity resolved by the credential.
+Pluribus-backed identity can still be selected explicitly. Local/federated node mode does not require it.
 
-See `docs/AGENT_INTEGRATION.md` for the full client contract.
+## Protocol scope
 
-## Roadmap
+Federated v1 supports **two participants per conversation**. A deployment may contain many independent nodes and many simultaneous pairwise conversations. Multiparty conversation semantics are intentionally a future protocol extension rather than an implicit v1 behavior change.
 
-- ✅ **X0 — Bootstrap & extraction contract**
-- ✅ **X1 — Independent pull-mode core, REST/MCP and passive monitor**
-- ◐ **X2 — Pluribus HTTP adapters**: implementation merged; real-provider certification pending
-- ◐ **X3 — Independent deployment**: packaging/runbook merged; real deployment/E2E certification pending
-- ⏳ **X4 — Pluribus cleanup**: only after X3 certification
+## Reliability contract
 
-Optional push/webhook delivery is tracked separately and does not block the pull-mode standalone service.
+CI protects:
+
+```text
+standalone baseline
++ local identity/node/trust
++ signed event log
++ replication/catch-up
++ coordinator epoch fencing
++ two-node conversation/restart
++ failover
++ supervisor
++ chaos/recovery
++ optional UX regressions
+```
+
+The final stable tag additionally requires a real two-host smoke with Pluribus fully unavailable.
 
 ## Documentation
 
-- `docs/ARCHITECTURE.md`
-- `docs/PLURIBUS_INTEGRATION.md`
+- `docs/FEDERATED_ARCHITECTURE.md`
+- `docs/RFC_DISTRIBUTED_PROTOCOL.md`
+- `docs/FEDERATED_DEPLOYMENT.md`
 - `docs/AGENT_INTEGRATION.md`
-- `docs/DEPLOYMENT.md`
+- `docs/PLURIBUS_INTEGRATION.md`
+- `docs/RELEASE_V1_RC1.md`
 
 ## License
 
