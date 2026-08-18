@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .adapters.local_identity import LocalIdentityAdapter
 from .adapters.pluribus_identity import PluribusIdentityAdapter
 from .adapters.pluribus_memory import PluribusMemoryAdapter
 from .adapters.unavailable_identity import UnavailableIdentityAdapter
@@ -29,6 +30,8 @@ def _configured_identity_provider() -> IdentityPort:
             settings.PLURIBUS_BASE_URL,
             timeout_seconds=settings.PLURIBUS_TIMEOUT_SECONDS,
         )
+    if settings.XERRAMECA_IDENTITY_PROVIDER == "local":
+        return LocalIdentityAdapter(settings.XERRAMECA_LOCAL_IDENTITY_PATH)
     return UnavailableIdentityAdapter()
 
 
