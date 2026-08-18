@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from xerrameca.node.app import create_node_app
 from xerrameca.node.dialogue import FederatedDialogueService, project_conversation
-from xerrameca.node.events import EventStore
+from xerrameca.node.events import EventEnvelope, EventStore
 from xerrameca.node.identity import initialize_node
 from xerrameca.node.replication import ReplicationService, canonical_json_bytes
 from xerrameca.node.trust import (
@@ -66,12 +66,7 @@ def _replicate_missing(
         )
 
 
-def _signed_post(
-    state_dir: Path,
-    app,
-    path: str,
-    payload: dict,
-):
+def _signed_post(state_dir: Path, app, path: str, payload: dict):
     body = canonical_json_bytes(payload)
     headers = {
         **sign_peer_request(
@@ -84,6 +79,12 @@ def _signed_post(
     }
     with TestClient(app) as client:
         return client.post(path, content=body, headers=headers)
+
+
+def _ingest_response_events(state_dir: Path, response) -> None:
+    EventStore(state_dir).ingest_many(
+        [EventEnvelope.from_dict(row) for row in response.json()["events"]]
+    )
 
 
 def test_two_nodes_complete_consensus_dialogue_and_restart_with_identical_history(
@@ -141,12 +142,7 @@ def test_two_nodes_complete_consensus_dialogue_and_restart_with_identical_histor
         {"conversation_id": conversation_id, "expected_epoch": 1},
     )
     assert claimed.status_code == 200, claimed.text
-    EventStore(b_dir).ingest_many(
-        [
-            __import__("xerrameca.node.events", fromlist=["EventEnvelope"]).EventEnvelope.from_dict(row)
-            for row in claimed.json()["events"]
-        ]
-    )
+    _ingest_response_events(b_dir, claimed)
     assert dialogue_b.get(conversation_id).current_turn["claimed_by_node_id"] == b.node_id
 
     reply_path = "/v1/node/federation/dialogue/reply"
@@ -162,12 +158,7 @@ def test_two_nodes_complete_consensus_dialogue_and_restart_with_identical_histor
         },
     )
     assert proposed.status_code == 200, proposed.text
-    EventStore(b_dir).ingest_many(
-        [
-            __import__("xerrameca.node.events", fromlist=["EventEnvelope"]).EventEnvelope.from_dict(row)
-            for row in proposed.json()["events"]
-        ]
-    )
+    _ingest_response_events(b_dir, proposed)
 
     proposal_view = dialogue_a.get(conversation_id)
     assert proposal_view.completion_proposal["by_node_id"] == b.node_id
@@ -212,7 +203,6 @@ def test_two_nodes_complete_consensus_dialogue_and_restart_with_identical_histor
     ]
     assert history_a == history_b
 
-    # Node/process restart: identity, local DB and projected history survive.
     restarted_b = FederatedDialogueService(b_dir)
     assert restarted_b.get(conversation_id).to_dict() == view_a.to_dict()
     assert [
@@ -221,7 +211,7 @@ def test_two_nodes_complete_consensus_dialogue_and_restart_with_identical_histor
 
 
 def test_max_rounds_blocks_after_second_slot_continue(tmp_path: Path) -> None:
-    a_dir, b_dir, a, b = _trusted_nodes(tmp_path)
+    a_dir, _, a, b = _trusted_nodes(tmp_path)
     dialogue = FederatedDialogueService(a_dir)
     view = dialogue.create(
         b.node_id,
@@ -289,8 +279,6 @@ def test_completion_rejection_preserves_standalone_turn_semantics(tmp_path: Path
     )
 
     assert continued.completion_proposal is None
-    # Standalone dialogue-v1 semantics: a rejected slot-2 proposal consumes the
-    # confirmer's next-round slot, therefore the second participant goes next.
     assert continued.current_turn["assigned_node_id"] == b.node_id
     assert continued.current_turn["round"] == 2
     assert continued.current_turn["slot"] == 2
