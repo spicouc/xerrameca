@@ -16,7 +16,10 @@ class Settings(BaseSettings):
     XERRAMECA_HOST: str = "0.0.0.0"
     XERRAMECA_PORT: int = 8791
     XERRAMECA_DB_PATH: str = "/var/lib/xerrameca/xerrameca.db"
-    XERRAMECA_IDENTITY_PROVIDER: Literal["unavailable", "pluribus"] = "unavailable"
+    XERRAMECA_IDENTITY_PROVIDER: Literal["unavailable", "local", "pluribus"] = (
+        "unavailable"
+    )
+    XERRAMECA_LOCAL_IDENTITY_PATH: str = "/etc/xerrameca/local-identities.json"
     XERRAMECA_SUMMARY_DISPATCH_SECONDS: float = 30.0
     XERRAMECA_SUMMARY_MAX_ATTEMPTS: int = 10
     PLURIBUS_BASE_URL: str = "http://127.0.0.1:8790"
