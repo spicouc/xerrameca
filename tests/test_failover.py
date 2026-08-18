@@ -41,7 +41,13 @@ def _trusted_nodes(tmp_path: Path):
     return a_dir, b_dir, a, b
 
 
-def _replicate_epoch(source_dir: Path, destination_dir: Path, sender: str, cid: str, epoch: int) -> int:
+def _replicate_epoch(
+    source_dir: Path,
+    destination_dir: Path,
+    sender: str,
+    cid: str,
+    epoch: int,
+) -> int:
     source = EventStore(source_dir)
     destination = ReplicationService(destination_dir)
     events = source.list_events(cid, epoch=epoch, from_sequence=1)
@@ -147,7 +153,7 @@ def test_expired_coordinator_self_fences_before_peer_takeover(tmp_path: Path) ->
     assert view_a.coordinator_id == b.node_id
     assert view_a.coordinator_epoch == 2
 
-    with pytest.raises(ForbiddenError, match="not conversation coordinator"):
+    with pytest.raises(ForbiddenError, match="local node is not"):
         LeasedDialogueService(a_dir).claim(
             cid,
             claimant_node_id=a.node_id,
