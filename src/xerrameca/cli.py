@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from collections.abc import Sequence
 
@@ -9,6 +10,12 @@ import uvicorn
 from .config import settings
 from .node.app import create_node_app
 from .node.identity import initialize_node, load_node_state
+from .node.trust import (
+    accept_invite_over_http,
+    create_invite,
+    list_peers,
+    revoke_peer,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -32,6 +39,24 @@ def _parser() -> argparse.ArgumentParser:
 
     info = sub.add_parser("node-info", help="show public durable node identity")
     info.add_argument("--state-dir", required=True)
+
+    invite = sub.add_parser("invite", help="explicit peer trust bootstrap")
+    invite_sub = invite.add_subparsers(dest="invite_command", required=True)
+    invite_create = invite_sub.add_parser("create", help="create one bounded invite")
+    invite_create.add_argument("--state-dir", required=True)
+    invite_create.add_argument("--ttl", type=int, default=600)
+    invite_accept = invite_sub.add_parser("accept", help="accept a peer invite")
+    invite_accept.add_argument("--state-dir", required=True)
+    invite_accept.add_argument("token")
+    invite_accept.add_argument("--timeout", type=float, default=10.0)
+
+    peer = sub.add_parser("peer", help="inspect/revoke trusted peers")
+    peer_sub = peer.add_subparsers(dest="peer_command", required=True)
+    peer_list = peer_sub.add_parser("list", help="list trusted peers")
+    peer_list.add_argument("--state-dir", required=True)
+    peer_revoke = peer_sub.add_parser("revoke", help="revoke one peer")
+    peer_revoke.add_argument("--state-dir", required=True)
+    peer_revoke.add_argument("node_id")
 
     return parser
 
@@ -69,6 +94,35 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "node-info":
         print(json.dumps(load_node_state(args.state_dir).public_dict(), sort_keys=True))
+        return 0
+
+    if args.command == "invite" and args.invite_command == "create":
+        print(create_invite(args.state_dir, ttl_seconds=args.ttl))
+        return 0
+
+    if args.command == "invite" and args.invite_command == "accept":
+        peer = asyncio.run(
+            accept_invite_over_http(
+                args.state_dir,
+                args.token,
+                timeout_seconds=args.timeout,
+            )
+        )
+        print(json.dumps(peer.public_dict(), sort_keys=True))
+        return 0
+
+    if args.command == "peer" and args.peer_command == "list":
+        print(
+            json.dumps(
+                [peer.public_dict() for peer in list_peers(args.state_dir)],
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "peer" and args.peer_command == "revoke":
+        peer = revoke_peer(args.state_dir, args.node_id)
+        print(json.dumps(peer.public_dict(), sort_keys=True))
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")
