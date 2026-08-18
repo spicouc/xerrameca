@@ -8,6 +8,7 @@ from collections.abc import Sequence
 import uvicorn
 
 from .config import settings
+from .dashboard import create_dashboard_app
 from .node.app import create_node_app
 from .node.identity import initialize_node, load_node_state
 from .node.supervisor import LocalSupervisor
@@ -37,6 +38,11 @@ def _parser() -> argparse.ArgumentParser:
     node.add_argument("--state-dir", required=True)
     node.add_argument("--host", default=settings.XERRAMECA_HOST)
     node.add_argument("--port", type=int, default=settings.XERRAMECA_PORT)
+
+    dashboard = sub.add_parser("dashboard", help="run optional read-only dashboard")
+    dashboard.add_argument("--state-dir", required=True)
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8792)
 
     info = sub.add_parser("node-info", help="show public durable node identity")
     info.add_argument("--state-dir", required=True)
@@ -105,6 +111,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "node":
         app = create_node_app(args.state_dir)
+        uvicorn.run(app, host=args.host, port=args.port)
+        return 0
+
+    if args.command == "dashboard":
+        app = create_dashboard_app(args.state_dir)
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
 
