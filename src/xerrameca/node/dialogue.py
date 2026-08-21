@@ -178,6 +178,10 @@ class FederatedDialogueService:
     def get(self, conversation_id: str) -> FederatedConversationView:
         return self._view(conversation_id)
 
+    def list_conversations(self) -> list[str]:
+        """List all local federated conversation ids (reconstructed from events)."""
+        return self.store.list_conversation_ids()
+
     def _participant(self, peer: PeerRecord) -> dict[str, str]:
         return {
             "node_id": peer.node_id,

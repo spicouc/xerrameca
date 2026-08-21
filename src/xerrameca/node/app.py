@@ -212,6 +212,41 @@ def create_node_app(state_dir: str) -> FastAPI:
             payload["coordinator_lease"] = lease.to_dict()
         return payload
 
+    @app.get(
+        "/v1/node/federation/conversations",
+        tags=["federated-dialogue"],
+    )
+    async def list_federated_conversations(
+        request: Request,
+        status: str | None = None,
+        peer_node_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        await authenticate_local_agent(request)
+        cids = dialogue.list_conversations()
+        summaries: list[dict[str, Any]] = []
+        for cid in cids:
+            view = dialogue.get(cid)
+            if status is not None and view.status != status:
+                continue
+            if peer_node_id is not None and peer_node_id not in view.participant_node_ids:
+                continue
+            summaries.append(
+                {
+                    "id": view.id,
+                    "objective": view.objective,
+                    "status": view.status,
+                    "coordinator_id": view.coordinator_id,
+                    "coordinator_epoch": view.coordinator_epoch,
+                    "current_round": view.current_round,
+                    "max_rounds": view.max_rounds,
+                    "participants": view.participant_node_ids,
+                }
+            )
+        if limit is not None:
+            summaries = summaries[:limit]
+        return {"conversations": summaries, "count": len(summaries)}
+
     @app.post(
         "/v1/node/federation/conversations/{conversation_id}/claim",
         tags=["federated-dialogue"],

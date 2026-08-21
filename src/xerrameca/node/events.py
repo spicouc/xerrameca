@@ -430,6 +430,14 @@ class EventStore:
                 raise
         return inserted
 
+    def list_conversation_ids(self) -> list[str]:
+        """Return all distinct federated conversation ids (authoritative source: events)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT conversation_id FROM federated_events ORDER BY conversation_id"
+            ).fetchall()
+        return [row["conversation_id"] for row in rows]
+
     def list_events(
         self,
         conversation_id: str,
