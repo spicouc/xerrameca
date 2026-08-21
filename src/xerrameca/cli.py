@@ -80,6 +80,30 @@ def _parser() -> argparse.ArgumentParser:
     supervisor_recover.add_argument("--now", type=int)
     supervisor_recover.add_argument("--max-retries", type=int, default=3)
 
+    conversation = sub.add_parser("conversation", help="federated conversation control")
+    conv_sub = conversation.add_subparsers(dest="conversation_command", required=True)
+    conv_create = conv_sub.add_parser("create", help="create a federated conversation")
+    conv_create.add_argument("--state-dir", required=True)
+    conv_create.add_argument("--peer", required=True)
+    conv_create.add_argument("--objective", required=True)
+    conv_create.add_argument("--rounds", type=int, default=5)
+    conv_create.add_argument("--delay", type=int, default=0)
+    conv_create.add_argument("--json", dest="as_json", action="store_true")
+    conv_status = conv_sub.add_parser("status", help="show conversation status")
+    conv_status.add_argument("--state-dir", required=True)
+    conv_status.add_argument("conversation_id")
+    conv_status.add_argument("--json", dest="as_json", action="store_true")
+    conv_list = conv_sub.add_parser("list", help="list federated conversations")
+    conv_list.add_argument("--state-dir", required=True)
+    conv_list.add_argument("--status", default=None)
+    conv_list.add_argument("--peer", default=None)
+    conv_list.add_argument("--limit", type=int, default=None)
+    conv_list.add_argument("--json", dest="as_json", action="store_true")
+    conv_sync = conv_sub.add_parser("sync", help="sync a conversation from coordinator")
+    conv_sync.add_argument("--state-dir", required=True)
+    conv_sync.add_argument("conversation_id")
+    conv_sync.add_argument("--json", dest="as_json", action="store_true")
+
     return parser
 
 
@@ -174,4 +198,72 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(payload, sort_keys=True))
         return 0
 
+    if args.command == "conversation" and args.conversation_command == "create":
+        from .command.service import XerramecaCommandService
+
+        svc = XerramecaCommandService(args.state_dir)
+        result = svc.create_conversation(
+            peer_node_id=args.peer,
+            objective=args.objective,
+            max_rounds=args.rounds,
+            delay_seconds=args.delay,
+        )
+        if args.as_json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(f"Creat: {result.get('id')}")
+            print(f"Peer: {args.peer}")
+            print(f"Objectiu: {args.objective}")
+            print(f"Rondes: {args.rounds}")
+            print(f"Status: {result.get('status', 'active')}")
+        return 0
+
+    if args.command == "conversation" and args.conversation_command == "status":
+        from .command.service import XerramecaCommandService
+
+        svc = XerramecaCommandService(args.state_dir)
+        result = svc.get_conversation(args.conversation_id)
+        if args.as_json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(f"Xerrameca #{result.get('id')} — {str(result.get('status','?')).upper()}")
+            print(f"Ronda {result.get('current_round','?')}/{result.get('max_rounds','?')}")
+            print(f"Objectiu: {result.get('objective','')}")
+            msgs = result.get('messages') or []
+            if msgs:
+                m = msgs[-1]
+                print(f"Últim: {m.get('author_node_id')}: {m.get('content')}")
+        return 0
+
+    if args.command == "conversation" and args.conversation_command == "list":
+        from .command.service import XerramecaCommandService
+
+        svc = XerramecaCommandService(args.state_dir)
+        items = svc.list_conversations(status=args.status, peer_node_id=args.peer, limit=args.limit)
+        if args.as_json:
+            print(json.dumps([i.to_dict() for i in items], sort_keys=True))
+        else:
+            if not items:
+                print("Cap conversa federada.")
+            for item in items:
+                print(f"{item.id}  [{item.status}]  ronda {item.current_round}/{item.max_rounds}  {item.objective}")
+        return 0
+
+    if args.command == "conversation" and args.conversation_command == "sync":
+        from .command.service import XerramecaCommandService
+
+        svc = XerramecaCommandService(args.state_dir)
+        result = svc.sync_conversation(args.conversation_id)
+        if args.as_json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(f"Sincronitzat: {result.get('id')}")
+            print(f"Status: {result.get('status','?')}")
+            print(f"Replication: {result.get('replication_status','n/a')}")
+        return 0
+
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
