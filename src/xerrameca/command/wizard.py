@@ -19,6 +19,8 @@ from typing import Any
 from .dto import WizardAction, WizardButton, WizardScreen, WizardSession
 from .presets import PRESETS, VALID_OUTPUT_MODES, VALID_ROLES, VALID_ROUNDS, get_preset
 
+CUSTOM_ROLE_MARKER = "custom"
+
 DEFAULT_TTL_SECONDS = 900
 
 WIZARD_STATES = (
@@ -161,7 +163,14 @@ class XerramecaWizardService:
             raise WizardError(f"transició il·legal {session.state} -> {target}")
         session.state = target
         self._sessions[session.session_id].expires_at = self._now() + self.ttl_seconds
+        return self._with_cancel(screen)
+    def _with_cancel(self, screen: WizardScreen) -> WizardScreen:
+        if screen.state in ("ROOT", "CANCELLED", "STARTED"):
+            return screen
+        if not any(b.action_id == "wizard:cancel" for b in screen.buttons):
+            screen.buttons.append(WizardButton(label="Cancel·lar", action_id="wizard:cancel"))
         return screen
+
     def _peer_screen(self) -> WizardScreen:
         from .service import XerramecaCommandService
 
@@ -214,9 +223,14 @@ class XerramecaWizardService:
             state="SELECT_ROLE_A", text="Rol de l'agent local:", buttons=buttons))
 
     def _select_role(self, session: WizardSession, action_id: str, slot: str) -> WizardScreen:
-        role = action_id.split(":", 1)[1]
-        if role not in VALID_ROLES:
-            raise WizardError("rol no vàlid")
+        role = action_id.split(":", 1)[1].strip()
+        if not role:
+            raise WizardError("rol buit")
+        if len(role) > 64:
+            raise WizardError("rol massa llarg")
+        if role not in VALID_ROLES and role != CUSTOM_ROLE_MARKER and not role.startswith(CUSTOM_ROLE_MARKER + ":"):
+            # custom free-text role: store verbatim, flagged as custom
+            pass
         session.data[slot] = role
         if slot == "role_a":
             roles = list(VALID_ROLES)

@@ -182,3 +182,119 @@ production nodes untouched: YES
 Telegram buttons, python-telegram-bot, callback_query handlers, active
 conversation screen, polling, watch, federated stop/cancel, multiparty,
 metrics, selfcheck.
+
+
+## UX-3 — TRANSPORT-NEUTRAL BUTTONS + TELEGRAM BRIDGE
+
+### Model neutral de pantalles i botons (src/xerrameca/ui/neutral.py)
+- `NeutralButton(label: str, callback_token: str)`: botó sense lligam de
+  transport. El transport (Telegram) el renderitza com a inline keyboard.
+- `NeutralScreen(text: str, buttons: list[NeutralButton], state: str)`:
+  pantalla neutral. `to_dict()` exposa text/state/buttons.
+- El model és transport-independent: cap import de telegram/aiogram/telebot.
+
+### CallbackStore (tokens curts, opacs i segurs)
+- `mint(*, caller_id, session_id, action_id) -> str`: genera token opac
+  (`base64.urlsafe_b64encode(os.urandom(9))`, sense padding) — curt i dins
+  del límit de 64 bytes de callback_data de Telegram.
+- Token vinculat a `(caller_id, session_id, action_id)` + `expires_at`.
+- `resolve(token, *, caller_id) -> (action_id, session_id)`:
+  rebutja tokens desconeguts, expirats o d'un altre caller (`CallbackError`).
+- `size_ok(token) -> bool`: `len(token) <= 64`.
+- **Cap secret dins callback_data**: mai conté API key, private key, token,
+  objective ni node_id. Només un handle opac a la taula interna.
+- TTL configurable (default 900s). Purga automàtica en mint/resolve.
+
+### TelegramWizardBridge (src/xerrameca/ui/telegram_wizard.py)
+- Cap state machine, presets, transicions, TTL ni idempotència pròpies:
+  tot resideix a `XerramecaWizardService`.
+- `start(caller_id) -> NeutralScreen`: crea sessió i rendeix pantalla ROOT.
+- `_render(session_id, caller_id, screen)`: per cada `WizardButton` del
+  wizard emet un `NeutralButton` amb un token opac (mint).
+- `handle_callback(caller_id, token) -> NeutralScreen`: resolveix token ->
+  (action_id, session_id) -> `wizard.handle_action` -> renderitzat.
+- `handle_text(caller_id, session_id, text) -> NeutralScreen | None`:
+  input de text lliure per `ENTER_OBJECTIVE` (`objective:set`) i
+  `SELECT_ROLE_A/B` (rol per slot, inclosos rols custom).
+- `active_session_id(caller_id)`: sessió activa del caller (per text input).
+- `CUSTOM_ROLE_MARKER = "custom"`.
+
+### TelegramUXAdapter (src/xerrameca/integrations/telegram.py)
+- **NO conté la state machine**: delega 100% a `XerramecaWizardService`
+  via `TelegramWizardBridge`.
+- `start_wizard(chat_id)`: renderitza la pantalla ROOT per botons.
+- `handle_callback(chat_id, token)`: resol i avança el wizard; captura errors
+  i envia un missatge d'error (no avança silenciosament).
+- `handle_wizard_text(chat_id, text)`: si el caller té sessió activa en estat
+  `ENTER_OBJECTIVE`/`SELECT_ROLE_A/B`, envia el text al bridge; altrament
+  ignora (deixa passar les comandes legacy).
+- Accepta `wizard=` opcional al constructor; sense ell, l'adapter només fa
+  les comandes legacy (Telegram continua sent OPCIONAL).
+
+### /xerrameca root
+- `/xerrameca` sense arguments obre el wizard interactiu per botons
+  (pantalla ROOT: Nova conversa / Converses / Agents / Ajuda).
+
+### Flux complet wizard per botons
+ROOT -> [Nova conversa] -> SELECT_PEER (peer trusted) ->
+SELECT_DIALOGUE_TYPE (preset) -> ENTER_OBJECTIVE (text) ->
+SELECT_ROLE_A (rol) -> SELECT_ROLE_B (rol) -> SELECT_ROUNDS ->
+SELECT_OUTPUT_MODE -> CONFIRM -> [INICIAR] -> STARTED.
+Cada botó porta un callback token opac; el bridge el resol i avança.
+
+### Text input
+- **Objective**: a `ENTER_OBJECTIVE` l'usuari envia text lliure ->
+  `objective:set`.
+- **Custom role**: a `SELECT_ROLE_A/B` l'usuari envia el nom del rol ->
+  `role_a:<text>` / `role_b:<text>` (el wizard accepta rols custom).
+
+### BACK semantics
+- Botó "Enrere" (`nav:back`): reconstrueix la pantalla de l'estat anterior.
+  Només modifica l'estat local del wizard. No recrea conversa federada.
+
+### wizard CANCEL semantics
+- Botó "Cancel·lar" (`wizard:cancel`) present a TOTES les pantalles pre-START.
+- Cancel·la LA SESSIÓ DEL WIZARD abans de START. NO cancel·la cap conversa
+  federada (el core no exposa aturada de runtime segura).
+
+### confirm:start idempotent
+- `confirm:start` a CONFIRM crida `XerramecaCommandService.create_conversation`
+  exactament 1 vegada; la sessió recorda `conversation_id` i tota crida
+  posterior (doble click amb el mateix token) retorna la mateixa conversa.
+
+### Compatibilitat legacy (sense canvis de comportament)
+- `/xerrameca start <peer> <objective> [rounds]`: `adapter.start(...)`.
+- `/xerrameca status <id>`: `adapter.status(...)`.
+- `/xerrameca sync <id>`: `adapter.sync(...)`.
+- `/xerrameca mode <id> <mode>`: `adapter.set_mode(...)`.
+- Les comandes textuals continuen funcionant; el wizard és addicional.
+
+### Telegram és opcional i no és font d'estat federat
+- L'adapter pot funcionar sense wizard (només legacy).
+- Cap estat federat s'origina a Telegram: el wizard només crea/configura
+  via `XerramecaCommandService` (la mateixa font que les comandes CLI).
+
+### Tests UX-3 (tests/test_ux3.py, 22 tests) — 22 passed
+Neutral button model, Telegram transport compatibility, /xerrameca root,
+wizard via buttons, text input (objective + custom role), trusted peer
+rendering, presets, roles, rounds, output mode, BACK, wizard CANCEL,
+confirm:start, duplicate START protection (idempotència + 1 crida a
+create_conversation), callback ownership, callback expiry, callback size,
+secret leakage, legacy Telegram commands, Telegram external dependency NONE.
+
+### Architecture gate UX-3
+protocol v1 unchanged: YES
+event schema unchanged: YES
+node federation unchanged: YES
+replication unchanged: YES
+failover unchanged: YES
+signed events unchanged: YES
+2-participant invariant unchanged: YES
+Pluribus dependency: NONE
+Telegram external library dependency: NONE
+production nodes touched: NO
+
+### NO inclòs en aquest PR (UX-4+)
+Active conversation screen (runtime status per botons), polling/watch,
+python-telegram-bot/aiogram wiring real, federated stop/cancel, multiparty,
+metrics, selfcheck.
