@@ -55,10 +55,15 @@ class FakeTelegramTransport:
         return [t for cid, t in self.messages if cid == chat_id]
 
 
+from pathlib import Path
+
+SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+
+
 def _start_node(sd, port):
     p = subprocess.Popen(
         [sys.executable, "-m", "xerrameca.cli", "node", "--state-dir", sd, "--host", "127.0.0.1", "--port", str(port)],
-        env=dict(os.environ, PYTHONPATH="/opt/xerrameca-ux3/src"),
+        env=dict(os.environ, PYTHONPATH=str(SRC_DIR)),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     for _ in range(60):
@@ -230,7 +235,6 @@ async def test_presets(adapter):
     await _drive(adapter, chat, "Nova conversa")
     await _drive(adapter, chat, "PeerAgent")
     labels = [t[0] for t in adapter["transport"].last_screen_tokens(chat)]
-    open("/tmp/ux3_presets_labels.txt", "w").write(repr(labels))
     for key in ("Conversa", "Brainstorm", "Debat", "Revisió", "Decisió", "Tasca"):
         assert any(key in l for l in labels), key
 
@@ -414,7 +418,14 @@ def test_telegram_no_hard_external_imports():
     """telegram.py must not import python-telegram-bot/aiogram/telebot."""
     import ast
 
-    src = open("/opt/xerrameca-ux3/src/xerrameca/integrations/telegram.py").read()
+    src_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "xerrameca"
+        / "integrations"
+        / "telegram.py"
+    )
+    src = src_path.read_text(encoding="utf-8")
     tree = ast.parse(src)
     imported = set()
     for node in ast.walk(tree):
