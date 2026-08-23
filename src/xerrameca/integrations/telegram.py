@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from xerrameca.ui import CallbackStore, TelegramWizardBridge
+
 from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any, Protocol
+
+from ..command.wizard import WizardError
+from ..ui.neutral import CallbackError
 
 import httpx
 
@@ -32,6 +37,7 @@ class TelegramUXAdapter:
         transport: TelegramTransport,
         client: httpx.AsyncClient | None = None,
         client_factory: Callable[[], Awaitable[httpx.AsyncClient]] | None = None,
+        wizard: TelegramWizardBridge | None = None,
     ) -> None:
         self.node_base_url = node_base_url.rstrip("/")
         self._api_key = api_key
@@ -39,6 +45,7 @@ class TelegramUXAdapter:
         self._client = client
         self._client_factory = client_factory
         self._modes: dict[str, TelegramMode] = {}
+        self._wizard = wizard
 
     def mode_for(self, conversation_id: str) -> TelegramMode:
         return self._modes.get(conversation_id, TelegramMode.SUMMARY)
@@ -148,18 +155,85 @@ class TelegramUXAdapter:
     async def notify(self, chat_id: str, conversation: dict[str, Any]) -> None:
         await self.transport.send(chat_id, self.render(conversation))
 
+
+    # ---- Wizard (button-driven) surface ----
+    async def start_wizard(self, chat_id: str) -> None:
+        """Render the root wizard screen with opaque callback buttons."""
+        if self._wizard is None:
+            await self.transport.send(chat_id, "Wizard no disponible en aquest node.")
+            return
+        screen = self._wizard.start(str(chat_id))
+        await self.transport.send(chat_id, screen.text)
+        for b in screen.buttons:
+            await self.transport.send(chat_id, f"[{b.label}] ::{b.callback_token}")
+
+    async def handle_callback(self, chat_id: str, token: str) -> None:
+        if self._wizard is None:
+            await self.transport.send(chat_id, "Wizard no disponible.")
+            return
+        try:
+            screen = self._wizard.handle_callback(str(chat_id), token)
+        except (WizardError, CallbackError):
+            # Controlled, user-facing error. No raw internals leaked.
+            await self.transport.send(
+                chat_id, "Acció no vàlida o expirada. Torna a obrir /xerrameca."
+            )
+            return
+        except Exception:
+            # Unexpected: do not expose internals. Internal log only.
+            await self.transport.send(
+                chat_id, "S'ha produït un error inesperat. Torna a obrir /xerrameca."
+            )
+            return
+        await self.transport.send(chat_id, screen.text)
+        for b in screen.buttons:
+            await self.transport.send(chat_id, f"[{b.label}] ::{b.callback_token}")
+
+    async def handle_wizard_text(self, chat_id: str, session_marker: str, text: str) -> bool:
+        """Free-text input (objective / custom role). Returns True if handled."""
+        if self._wizard is None:
+            return False
+        session_id = session_marker
+        screen = self._wizard.handle_text(str(chat_id), session_id, text)
+        if screen is None:
+            return False
+        await self.transport.send(chat_id, screen.text)
+        for b in screen.buttons:
+            await self.transport.send(chat_id, f"[{b.label}] ::{b.callback_token}")
+        return True
+
     async def handle_text(self, chat_id: str, text: str) -> dict[str, Any] | None:
         """Handle the small Telegram control surface.
 
         Supported forms:
+          /xerrameca                -> open/resume the wizard (button surface)
           /xerrameca start <peer_node_id> <objective>
           /xerrameca status <conversation_id>
           /xerrameca sync <conversation_id>
           /xerrameca mode <conversation_id> silent|summary|live
 
+        Free-text that is not a /xerrameca command is routed to the wizard only
+        when that caller has an active wizard session expecting text input
+        (objective or a custom role). Otherwise it is ignored (never invented as
+        wizard state).
+
         Pause/continue/tell are intentionally not emulated when the core has no
         corresponding safe operation; UI adapters must never invent state.
         """
+        if self._wizard is not None and text.strip().lower() == "/xerrameca":
+            await self.start_wizard(chat_id)
+            return None
+
+        # FASE 2: free-text wizard input (objective / custom role) via public surface.
+        if self._wizard is not None:
+            active = self._wizard.active_session_id(str(chat_id))
+            if active is not None:
+                try:
+                    handled = await self.handle_wizard_text(chat_id, active, text)
+                except (WizardError, CallbackError):
+                    handled = False
+                if handled:
+                    return None
 
         parts = text.strip().split()
         if len(parts) < 2 or parts[0].lower() != "/xerrameca":

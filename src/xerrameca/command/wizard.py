@@ -19,6 +19,9 @@ from typing import Any
 from .dto import WizardAction, WizardButton, WizardScreen, WizardSession
 from .presets import PRESETS, VALID_OUTPUT_MODES, VALID_ROLES, VALID_ROUNDS, get_preset
 
+CUSTOM_ROLE_MARKER = "custom"
+CUSTOM_INPUT_MARKER = "custom_input"
+
 DEFAULT_TTL_SECONDS = 900
 
 WIZARD_STATES = (
@@ -69,6 +72,7 @@ class XerramecaWizardService:
         self.ttl_seconds = ttl_seconds
         self.node_port = node_port
         self._sessions: dict[str, _SessionRecord] = {}
+        self._active_caller: dict[str, str] = {}
 
     # ----- session lifecycle ------------------------------------------
     def _now(self) -> int:
@@ -92,6 +96,8 @@ class XerramecaWizardService:
         self._sessions[session_id] = _SessionRecord(
             session=session, expires_at=now + self.ttl_seconds
         )
+        # track active session per caller (FASE 4)
+        self._active_caller[caller_id] = session_id
         return session
 
     def _require_session(self, session_id: str, caller_id: str) -> WizardSession:
@@ -103,12 +109,77 @@ class XerramecaWizardService:
             raise WizardError("sessió no pertany a aquest caller")
         return rec.session
 
+    # ----- public session API (FASE 6) -----
+    def get_session(self, session_id: str, caller_id: str) -> WizardSession:
+        """Public, caller-owned session lookup (TTL + ownership + stale rejection)."""
+        return self._require_session(session_id, caller_id)
+
+    def resume(self, caller_id: str) -> WizardSession | None:
+        """Return the caller's active wizard session if valid (not started/cancelled/expired)."""
+        self._purge_expired()
+        sid = self._active_caller.get(caller_id)
+        if sid is None:
+            return None
+        rec = self._sessions.get(sid)
+        if rec is None:
+            self._active_caller.pop(caller_id, None)
+            return None
+        st = rec.session.state
+        if st in ("STARTED", "CANCELLED"):
+            return None
+        return rec.session
+
+    def current_screen(self, session_id: str, caller_id: str) -> WizardScreen:
+        """Rebuild the neutral screen for the session's current state."""
+        session = self._require_session(session_id, caller_id)
+        state = session.state
+        if state == "ROOT":
+            return self.root_screen()
+        if state == "SELECT_PEER":
+            return self._peer_screen()
+        if state == "SELECT_DIALOGUE_TYPE":
+            return self._rebuild_dialogue_type(session)
+        if state == "ENTER_OBJECTIVE":
+            return WizardScreen(state="ENTER_OBJECTIVE", text="Objectiu:",
+                                buttons=[WizardButton(label="Enrere", action_id="nav:back")])
+        if state == "SELECT_ROLE_A":
+            return self._rebuild_roles(session, "role_a")
+        if state == "SELECT_ROLE_B":
+            return self._rebuild_roles(session, "role_b")
+        if state == "SELECT_ROUNDS":
+            return self._rebuild_rounds(session)
+        if state == "SELECT_OUTPUT_MODE":
+            return self._rebuild_output(session)
+        if state == "CONFIRM":
+            return self._confirm_screen(session)
+        if state == "STARTED":
+            return WizardScreen(state="STARTED",
+                                text=f"Conversa ja iniciada: {session.data.get('conversation_id', '')}",
+                                buttons=[])
+        if state == "CANCELLED":
+            return WizardScreen(state="CANCELLED", text="Wizard cancel·lat (sessió local, no federada).", buttons=[])
+        return self.root_screen()
+
     def root_screen(self) -> WizardScreen:
         return WizardScreen(
             state="ROOT",
             text="Xerrameca — tria una acció:",
             buttons=list(ROOT_ACTIONS),
         )
+
+    def expected_text_input(self, session: WizardSession) -> str:
+        """Local metadata: what free-text the wizard currently expects.
+
+        One of: 'objective', 'role_a_custom', 'role_b_custom', 'none'.
+        Does NOT add any federated protocol field.
+        """
+        if session.state == "ENTER_OBJECTIVE":
+            return "objective"
+        if session.state == "SELECT_ROLE_A" and session.data.get("role_a_expects_custom"):
+            return "role_a_custom"
+        if session.state == "SELECT_ROLE_B" and session.data.get("role_b_expects_custom"):
+            return "role_b_custom"
+        return "none"
 
     def handle_action(self, session_id: str, caller_id: str, action: WizardAction) -> WizardScreen:
         session = self._require_session(session_id, caller_id)
@@ -161,13 +232,40 @@ class XerramecaWizardService:
             raise WizardError(f"transició il·legal {session.state} -> {target}")
         session.state = target
         self._sessions[session.session_id].expires_at = self._now() + self.ttl_seconds
+        return self._with_cancel(screen)
+    def _with_cancel(self, screen: WizardScreen) -> WizardScreen:
+        if screen.state in ("ROOT", "CANCELLED", "STARTED"):
+            return screen
+        if not any(b.action_id == "wizard:cancel" for b in screen.buttons):
+            screen.buttons.append(WizardButton(label="Cancel·lar", action_id="wizard:cancel"))
         return screen
+
+    def _role_buttons(self, slot: str) -> list[WizardButton]:
+        """Build role selection buttons for a given slot.
+
+        The visible "custom" button uses the internal marker action
+        ``{slot}:custom_input`` (NOT ``{slot}:custom``), so free text is only
+        accepted after the user explicitly chooses custom. ``VALID_ROLES``
+        intentionally includes "custom" as a *value* (consumed elsewhere, e.g.
+        UX-2 direct handle_action); it must never be rendered as a selectable
+        role button here.
+        """
+        buttons = [
+            WizardButton(label=role, action_id=f"{slot}:{role}")
+            for role in VALID_ROLES
+            if role != CUSTOM_ROLE_MARKER
+        ]
+        buttons.append(
+            WizardButton(label=CUSTOM_ROLE_MARKER, action_id=f"{slot}:{CUSTOM_INPUT_MARKER}")
+        )
+        return buttons
+
     def _peer_screen(self) -> WizardScreen:
         from .service import XerramecaCommandService
 
         agents = XerramecaCommandService(self.state_dir, node_port=self.node_port).list_agents()
         buttons = [
-            WizardButton(label=f"{a.display_name} ({'online' if a.online else 'offline'})", action_id=f"peer:{a.node_id}")
+            WizardButton(label=f"{a.display_name} ({'online' if a.online else ('unknown' if a.online is None else 'offline')})", action_id=f"peer:{a.node_id}")
             for a in agents
         ]
         if not buttons:
@@ -207,20 +305,36 @@ class XerramecaWizardService:
         if not objective:
             raise WizardError("objectiu buit")
         session.data["user_objective"] = objective
-        roles = list(VALID_ROLES)
-        buttons = [WizardButton(label=r, action_id=f"role_a:{r}") for r in roles]
+        buttons = self._role_buttons("role_a")
         buttons.append(WizardButton(label="Enrere", action_id="nav:back"))
         return self._transition(session, "SELECT_ROLE_A", WizardScreen(
             state="SELECT_ROLE_A", text="Rol de l'agent local:", buttons=buttons))
 
     def _select_role(self, session: WizardSession, action_id: str, slot: str) -> WizardScreen:
-        role = action_id.split(":", 1)[1]
-        if role not in VALID_ROLES:
-            raise WizardError("rol no vàlid")
-        session.data[slot] = role
+        role = action_id.split(":", 1)[1].strip()
+        if not role:
+            raise WizardError("rol buit")
+        if role == CUSTOM_INPUT_MARKER:
+            # User explicitly chose custom: expect free-text input next, stay on screen.
+            session.data[f"{slot}_expects_custom"] = True
+            return self._transition(session, "SELECT_ROLE_" + ("A" if slot == "role_a" else "B"),
+                                    self._rebuild_roles(session, slot))
+        expects_custom = session.data.get(f"{slot}_expects_custom", False)
+        if len(role) > 64:
+            raise WizardError("rol massa llarg")
+        if role in VALID_ROLES or role == CUSTOM_ROLE_MARKER:
+            # explicit valid role, or the literal "custom" value (UX-2 contract)
+            session.data.pop(f"{slot}_expects_custom", None)
+            session.data[slot] = role
+        elif expects_custom:
+            # free-text custom role: store verbatim
+            session.data.pop(f"{slot}_expects_custom", None)
+            session.data[slot] = role
+        else:
+            raise WizardError("rol no reconegut (tria un rol vàlid o 'custom')")
         if slot == "role_a":
-            roles = list(VALID_ROLES)
-            buttons = [WizardButton(label=r, action_id=f"role_b:{r}") for r in roles]
+            buttons = self._role_buttons("role_b")
+            buttons.append(WizardButton(label="Enrere", action_id="nav:back"))
             return self._transition(session, "SELECT_ROLE_B", WizardScreen(
                 state="SELECT_ROLE_B", text="Rol de l'agent peer:", buttons=buttons))
         rounds = [WizardButton(label=str(r), action_id=f"rounds:{r}") for r in VALID_ROUNDS]
@@ -292,8 +406,7 @@ class XerramecaWizardService:
         return WizardScreen(state="SELECT_DIALOGUE_TYPE", text="Tria el tipus de diàleg:", buttons=buttons)
 
     def _rebuild_roles(self, session: WizardSession, slot: str) -> WizardScreen:
-        roles = list(VALID_ROLES)
-        buttons = [WizardButton(label=r, action_id=f"{slot}:{r}") for r in roles]
+        buttons = self._role_buttons(slot)
         buttons.append(WizardButton(label="Enrere", action_id="nav:back"))
         state = "SELECT_ROLE_A" if slot == "role_a" else "SELECT_ROLE_B"
         return WizardScreen(state=state, text=f"Rol {slot}:", buttons=buttons)
