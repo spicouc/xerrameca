@@ -298,3 +298,86 @@ production nodes touched: NO
 Active conversation screen (runtime status per botons), polling/watch,
 python-telegram-bot/aiogram wiring real, federated stop/cancel, multiparty,
 metrics, selfcheck.
+
+## UX-3.1 — HARDENING DE LA SUPERFÍCIE PÚBLICA
+
+Objectiu: tancar les mancances entre els tests i el flux públic real de
+Telegram abans del merge d'UX-3. Cap canvi de protocol, schema d'events,
+replicació, failover ni invariant de 2 participants.
+
+### /xerrameca entra realment per handle_text()
+`TelegramUXAdapter.handle_text()` rep `"/xerrameca"` (sense arguments) i
+obra/reprend el wizard via la superfície pública (no es crida `start_wizard`
+directament als tests d'integració). Les comandes legacy (`/xerrameca start …`,
+`status`, `sync`, `mode`) continuen funcionant.
+
+### objective entra per handle_text()
+El text lliure que NO és una comanda `/xerrameca …` es delega automàticament
+al wizard **només si el caller té una sessió activa i l'estat espera text**
+(`expected_text_input` ∈ `{objective, role_a_custom, role_b_custom}`). En cas
+contrari el missatge NO es consumeix.
+
+### Rol custom = selecció explícita + text següent
+El botó visible `custom` té com a action_id **`{slot}:custom_input`** (marker
+UX intern), mai `role_a:custom` / `role_b:custom`. En prémer-lo, el wizard
+marca `expected_text_input = {slot}_custom` i roman a la pantalla esperant
+text. El text següent es guarda com a rol (`role_a` / `role_b`) i avança.
+`VALID_ROLES` continua incloent `"custom"` com a *valor* (consumit per UX-2 via
+`handle_action` directe), però **no es renderitza mai com a botó seleccionable**.
+
+La construcció dels botons de rol està centralitzada a `XerramecaWizardService._role_buttons(slot)`,
+usada a SELECT_ROLE_A, SELECT_ROLE_B i `_rebuild_roles()`. Això garanteix
+exactament UN botó `custom` per pantalla (action `role_{a,b}:custom_input`).
+
+### Text lliure sense haver premut custom: REBUTJAT
+A SELECT_ROLE_A/B, si l'usuari envia text sense haver triat `custom`, el wizard
+NO el consumeix, NO modifica el rol i NO avança l'estat (retorna `handled=False`).
+
+### Una sessió activa per caller
+`TelegramWizardBridge.start(caller_id)` implementa la política:
+- sessió activa i vàlida (estat ≠ STARTED/CANCELLED i no expirada) → reprendre i
+  renderitzar la sessió existent (`wizard.resume(caller_id)`).
+- altrament → crear nova sessió i **invalidar els callbacks de la sessió
+  anterior del mateix caller** (`CallbackStore.invalidate_caller` /
+  `invalidate_session`).
+
+### API pública de consulta de sessió
+El bridge NO accedeix a membres privats del wizard. `XerramecaWizardService`
+exposa `get_session(session_id, caller_id)`, `resume(caller_id)`,
+`current_screen(session_id, caller_id)` i `expected_text_input(session)`, tots
+amb TTL/ownership/stale-rejection en un únic lloc.
+
+### Peer status: online / offline / unknown
+`online is None` (no comprovat) es renderitza com **`unknown`**, mai `offline`.
+`list_agents()` continua sent l'autoritat.
+
+### Errors controlats
+`TelegramUXAdapter.handle_callback` / `handle_wizard_text` capturen
+explícitament `WizardError` i `CallbackError` i responen amb un missatge
+genèric (`"Acció no vàlida o expirada. Torna a obrir /xerrameca."`) **sense**
+exposar paths, tracebacks, nodes interns ni raw exceptions. Errors inesperats
+es registren internament sense silenciar-los com a funcionals.
+
+### Telegram Inline Keyboard real: ENCARA NO
+UX-3/UX-3.1 mantenen el model neutral (`NeutralButton`/`NeutralScreen`/
+`CallbackStore`) + bridge Telegram. **No** hi ha `InlineKeyboardMarkup` real ni
+dependència de `python-telegram-bot`/`aiogram`. El wiring físic queda per UX-4.
+
+### Tests UX-3.1 (tests/test_ux31.py, 14 tests) — 14 passed
+Cobertura end-to-end sobre la superfície pública real:
+`/xerrameca` via `handle_text`, objective via `handle_text`, custom role A/B via
+`handle_text`, reject de text lliure sense custom, resume de sessió activa,
+invalidació de callbacks antics, caller diferent reject, callback expirat
+reject, peer `unknown`, error controlat sense leak intern, legacy commands,
+unicitat del botó `custom` (action `role_*:custom_input`, absència de
+`role_*:custom`) i BACK/rebuild mantenen la unicitat.
+
+### Architecture gate UX-3.1
+protocol v1 unchanged: YES
+event schema unchanged: YES
+replication unchanged: YES
+failover unchanged: YES
+2-participant invariant unchanged: YES
+Telegram external library dependency: NONE
+Pluribus dependency: NONE
+production nodes touched: NO

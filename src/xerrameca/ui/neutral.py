@@ -53,6 +53,7 @@ class CallbackStore:
     def __init__(self, *, ttl_seconds: int = 900) -> None:
         self.ttl_seconds = ttl_seconds
         self._tokens: dict[str, _CallbackRecord] = {}
+        self._by_session: dict[str, set[str]] = {}
 
     def _now(self) -> int:
         return int(time.time())
@@ -72,6 +73,7 @@ class CallbackStore:
             action_id=action_id,
             expires_at=self._now() + self.ttl_seconds,
         )
+        self._by_session.setdefault(session_id, set()).add(token)
         return token
 
     def resolve(self, token: str, *, caller_id: str) -> tuple[str, str]:
@@ -86,6 +88,13 @@ class CallbackStore:
         if rec.caller_id != caller_id:
             raise CallbackError("callback no pertany a aquest caller")
         return rec.action_id, rec.session_id
+
+    def invalidate_session(self, session_id: str) -> None:
+        """Drop all live callback tokens bound to a session (no secrets exposed)."""
+        self._purge()
+        tokens = self._by_session.pop(session_id, set())
+        for t in tokens:
+            self._tokens.pop(t, None)
 
     def size_ok(self, token: str) -> bool:
         return len(token) <= 64

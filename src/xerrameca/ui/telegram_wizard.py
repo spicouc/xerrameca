@@ -24,6 +24,13 @@ class TelegramWizardBridge:
         self._active: dict[str, str] = {}
 
     def start(self, caller_id: str) -> NeutralScreen:
+        # FASE 4: resume active valid session; otherwise create new (invalidating old callbacks).
+        existing = self.wizard.resume(caller_id)
+        if existing is not None:
+            return self._render(existing.session_id, caller_id, self.wizard.current_screen(existing.session_id, caller_id))
+        old = self._active.get(caller_id)
+        if old is not None:
+            self.callbacks.invalidate_session(old)
         session = self.wizard.create_session(caller_id)
         return self._render(session.session_id, caller_id, self.wizard.root_screen())
 
@@ -46,24 +53,30 @@ class TelegramWizardBridge:
         return self._render(session_id, caller_id, screen)
 
     def handle_text(self, caller_id: str, session_id: str, text: str) -> NeutralScreen | None:
-        """Free-text input for objective and custom roles.
+        """Free-text input routed by the wizard's expected-text contract.
 
         Returns a rendered screen when the text advances the wizard, else None.
+        Does NOT interpret arbitrary text as wizard input; only acts when the
+        wizard explicitly expects objective or a custom role for the active slot.
         """
-        session = self.wizard._require_session(session_id, caller_id)
-        state = session.state
+        session = self.wizard.get_session(session_id, caller_id)
         text = text.strip()
         if not text:
             return None
-        if state == "ENTER_OBJECTIVE":
+        expected = self.wizard.expected_text_input(session)
+        if expected == "objective":
             screen = self.wizard.handle_action(
                 session_id, caller_id, WizardAction(action_id="objective:set", payload={"objective": text})
             )
             return self._render(session_id, caller_id, screen)
-        if state in ("SELECT_ROLE_A", "SELECT_ROLE_B"):
-            slot = "role_a" if state == "SELECT_ROLE_A" else "role_b"
+        if expected == "role_a_custom":
             screen = self.wizard.handle_action(
-                session_id, caller_id, WizardAction(action_id=f"{slot}:{text}")
+                session_id, caller_id, WizardAction(action_id=f"role_a:{text}")
+            )
+            return self._render(session_id, caller_id, screen)
+        if expected == "role_b_custom":
+            screen = self.wizard.handle_action(
+                session_id, caller_id, WizardAction(action_id=f"role_b:{text}")
             )
             return self._render(session_id, caller_id, screen)
         return None

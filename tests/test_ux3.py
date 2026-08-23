@@ -212,10 +212,12 @@ async def test_text_input_custom_role(adapter):
     await _drive(adapter, chat, "PeerAgent")
     await _drive(adapter, chat, "Conversa")
     await adapter["adapter"].handle_wizard_text(chat, adapter["bridge"].active_session_id(chat), "El meu objectiu")
-    await _drive(adapter, chat, None)
-    handled = await adapter["adapter"].handle_wizard_text(chat, adapter["bridge"].active_session_id(chat), "arquitecte")
+    await _drive(adapter, chat, None)  # SELECT_ROLE_A -> first role -> SELECT_ROLE_B
+    await _drive(adapter, chat, "custom")  # choose custom for role B
+    sid = adapter["bridge"].active_session_id(chat)
+    handled = await adapter["adapter"].handle_wizard_text(chat, sid, "arquitecte")
     assert handled is True
-    sess = adapter["wizard"]._require_session(adapter["bridge"].active_session_id(chat), chat)
+    sess = adapter["wizard"].get_session(adapter["bridge"].active_session_id(chat), chat)
     assert sess.data["role_b"] == "arquitecte"
 
 
@@ -367,7 +369,7 @@ async def test_callback_ownership(adapter):
     before = len(adapter["transport"].messages)
     await adapter["adapter"].handle_callback("other_chat", token)
     new_msgs = adapter["transport"].all_text("other_chat")
-    assert any("error" in m.lower() for m in new_msgs)
+    assert any(("expirada" in m.lower()) or ("no vàlida" in m.lower()) for m in new_msgs)
 
 
 @pytest.mark.asyncio
@@ -381,7 +383,7 @@ async def test_callback_expiry(adapter):
     adapter["callbacks"]._tokens[token].expires_at = int(time.time()) - 1
     await adapter["adapter"].handle_callback(chat, token)
     new_msgs = adapter["transport"].all_text(chat)
-    assert any("error" in m.lower() for m in new_msgs)
+    assert any(("expirada" in m.lower()) or ("no vàlida" in m.lower()) for m in new_msgs)
 
 
 def test_callback_size(adapter):
