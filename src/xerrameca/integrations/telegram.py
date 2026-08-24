@@ -194,39 +194,60 @@ class TelegramUXAdapter:
         screen = self._wizard.start(str(chat_id))
         await self._send_screen(chat_id, screen)
 
+    async def _ack_safely(self, callback_query_id: str | None) -> None:
+        """ACK a callback query without touching wizard or federated state.
+
+        ACK is intentionally non-authoritative: a failure, an absent id, or a
+        transport without ACK support is silently ignored. It never changes
+        wizard state, never reverts, never creates an event and never triggers
+        a retry.
+        """
+        if not callback_query_id:
+            return
+        if not self._transport_can_ack():
+            return
+        try:
+            await self.transport.answer_callback_query(callback_query_id)
+        except _TelegramTransportError:
+            pass
+        except Exception:
+            # Any unexpected ACK failure stays silent & non-authoritative.
+            pass
+
+    async def safe_ack(self, callback_query_id: str | None) -> None:
+        """Public, side-effect-free ACK used by the Update dispatcher (UX-4.3)."""
+        await self._ack_safely(callback_query_id)
+
     async def handle_callback(
         self, chat_id: str, token: str, callback_query_id: str | None = None
     ) -> None:
         if self._wizard is None:
             await self.transport.send(chat_id, "Wizard no disponible.")
+            await self._ack_safely(callback_query_id)
             return
+        error_text = None
         try:
             screen = self._wizard.handle_callback(str(chat_id), token)
         except (WizardError, CallbackError):
             # Controlled, user-facing error. No raw internals leaked.
-            await self.transport.send(
-                chat_id, "Acció no vàlida o expirada. Torna a obrir /xerrameca."
-            )
-            return
+            error_text = "Acció no vàlida o expirada. Torna a obrir /xerrameca."
         except _TelegramTransportError:
             # Telegram API failed to deliver the screen; no internals exposed.
-            await self.transport.send(
-                chat_id, "S'ha produït un error inesperat. Torna a obrir /xerrameca."
-            )
-            return
+            error_text = "S'ha produït un error inesperat. Torna a obrir /xerrameca."
         except Exception:
             # Unexpected: do not expose internals. Internal log only.
-            await self.transport.send(
-                chat_id, "S'ha produït un error inesperat. Torna a obrir /xerrameca."
-            )
+            error_text = "S'ha produït un error inesperat. Torna a obrir /xerrameca."
+        if error_text is not None:
+            await self.transport.send(chat_id, error_text)
+            # Always safe-ACK on the error path so Telegram's inline spinner is
+            # dismissed even for expired/invalid callbacks. ACK never mutates
+            # wizard/federated state.
+            await self._ack_safely(callback_query_id)
             return
         await self._send_screen(chat_id, screen)
-        if callback_query_id and self._transport_can_ack():
-            # ACK errors must never alter federated state.
-            try:
-                await self.transport.answer_callback_query(callback_query_id)
-            except _TelegramTransportError:
-                pass
+        # Single ACK helper: valid callback -> safe ACK; a transport or ACK
+        # failure here is swallowed and non-authoritative.
+        await self._ack_safely(callback_query_id)
 
     async def handle_wizard_text(self, chat_id: str, session_marker: str, text: str) -> bool:
         """Free-text input (objective / custom role). Returns True if handled."""
