@@ -557,3 +557,64 @@ pseudo-buttons when a real keyboard is available.
 - physical Telegram smoke
 - python-telegram-bot / aiogram / telebot
 - background workers
+
+## UX-4.3 — Telegram Update ingestion + dispatcher + simulated E2E
+
+Adds the Telegram **input** layer: a raw Telegram Update JSON is parsed only in
+`src/xerrameca/integrations/telegram_updates.py` and routed to the existing
+`TelegramUXAdapter` (message texts and `callback_query`s), which drives the
+wizard / command layer and renders through the existing
+`TelegramBotAPITransport` inline keyboard. No Telegram SDK, no polling, no
+webhook, no `pyproject.toml` change.
+
+### Layering
+- **`integrations/telegram_updates.py`** owns ALL Update parsing. It never
+  interprets wizard semantics (the callback_data stays an opaque token; free
+  text is forwarded verbatim). It contains no `while True`, no `getUpdates` /
+  `setWebhook`, no aiohttp / FastAPI server, no background task.
+- **`integrations/telegram.py`** (+ACK hardening) owns the wizard interaction
+  and rendering. Nothing in `command/`, `node/` or `ui/` parses Telegram JSON.
+- The federated core is untouched: no protocol v1 / event schema / replication
+  / failover / signed-events / 2-participant invariant change.
+
+### Dispatcher contract
+- `dispatch(update: Mapping) -> DispatchResult` where `DispatchResult` carries
+  `kind` (`handled | ignored | duplicate | rejected`), `update_id` and a
+  controlled `reason` (never a raw Update, token, objective, API key, bot token,
+  private key or filesystem path).
+- Message updates → `adapter.handle_text(chat_id, text)` (chat id coerced to
+  `str`). Callback updates → `adapter.handle_callback(chat_id, data,
+  callback_query_id=...)` (data is forwarded verbatim, never reinterpreted).
+- Controlled ignores: no `update_id`; message without text (incl. polls);
+  callback without data / chat; `edited_message`, `inline_query`,
+  `chosen_inline_result`; any unsupported type.
+- **At-most-once per `update_id`** within a live dispatcher instance (bounded
+  in-memory dedup window, default `max_seen_updates = 1024`, `deque`+`set`).
+  Ids are claimed **before** execution under a per-instance `asyncio.Lock`, so
+  `asyncio.gather(dispatch(u), dispatch(u))` executes only once. There is NO
+  global exactly-once claim and NO persistence: after a restart the cache is
+  gone (documented).
+- Duplicate callback_query → no wizard action; the callback transport is
+  safe-ACKed only (no federated mutation) so Telegram dismisses its spinner.
+- Optional `allowed_chat_ids: set[str] | None`. `None` = no filter. A denied
+  message is rejected with NO wizard mutation; a denied callback is rejected
+  with NO wizard mutation but a safe ACK.
+- **ACK hardening** in `TelegramUXAdapter`: a single `_ack_safely(...)` helper
+  (public `safe_ack(...)` for the dispatcher). Valid → ACK; expired/invalid →
+  safe ACK; rejected by allowlist → safe ACK; Telegram render error → safe ACK;
+  ACK failure → always silent & non-authoritative. ACK never changes wizard
+  state, never reverts, never creates an event, never retries.
+- Error boundary: unexpected exceptions are captured at the Telegram boundary
+  and returned as a controlled result; `f"{exc}"` is never surfaced to the user.
+
+### Test coverage (tests/test_ux43.py, >=30)
+Routing / parsing (message & callback, chat-id coercion, opaque data forwarding),
+ACK success/failure isolation, update_id dedup (message & callback, concurrent,
+bounded, per-instance), allowlist (allowed/denied message/callback, safe ACK),
+caller isolation, secret-free results, no Telegram SDK / no real network (always
+`httpx.MockTransport`), and a full simulated E2E driven ONLY by Telegram Update
+dicts through `dispatch()`: `/xerrameca → Nova conversa → peer → preset →
+objectiu (text) → role A → role B → rondes → sortida → INICIAR → conversa
+creada (exactament una vegada)`, then `/xerrameca → Converses → detall →
+Actualitzar → Mode → Enrere`. Plus duplicate-START and concurrent-START safety
+(`create_conversation` called exactly once).
