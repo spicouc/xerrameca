@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from ..command.wizard import WizardError
+from .telegram_bot_api import TelegramTransportError as _TelegramTransportError
 from ..ui.neutral import CallbackError
 
 import httpx
@@ -20,6 +21,9 @@ class TelegramMode(str, Enum):
 
 class TelegramTransport(Protocol):
     async def send(self, chat_id: str, text: str) -> None: ...
+    # Optional capabilities (duck-typed at runtime via hasattr):
+    #   async def send_buttons(self, chat_id, text, buttons) -> None
+    #   async def answer_callback_query(self, callback_query_id) -> None
 
 
 class TelegramUXAdapter:
@@ -46,6 +50,31 @@ class TelegramUXAdapter:
         self._client_factory = client_factory
         self._modes: dict[str, TelegramMode] = {}
         self._wizard = wizard
+
+    def _transport_has_buttons(self) -> bool:
+        """True if the transport can render a real inline keyboard."""
+        send_buttons = getattr(self.transport, "send_buttons", None)
+        return callable(send_buttons)
+
+    def _transport_can_ack(self) -> bool:
+        ack = getattr(self.transport, "answer_callback_query", None)
+        return callable(ack)
+
+    async def _send_screen(self, chat_id: str, screen: Any) -> None:
+        """Render a NeutralScreen (or any text+buttons object) to the transport.
+
+        If the transport supports real inline keyboards we send ONE message with
+        reply_markup.inline_keyboard; otherwise we fall back to the legacy
+        text + '[label] ::token' pseudo-button lines so older transports and
+        tests keep working unchanged.
+        """
+        if self._transport_has_buttons():
+            await self.transport.send_buttons(chat_id, screen.text, list(screen.buttons))
+            return
+        # Legacy fallback
+        await self.transport.send(chat_id, screen.text)
+        for b in screen.buttons:
+            await self.transport.send(chat_id, f"[{b.label}] ::{b.callback_token}")
 
     def mode_for(self, conversation_id: str) -> TelegramMode:
         return self._modes.get(conversation_id, TelegramMode.SUMMARY)
@@ -163,11 +192,11 @@ class TelegramUXAdapter:
             await self.transport.send(chat_id, "Wizard no disponible en aquest node.")
             return
         screen = self._wizard.start(str(chat_id))
-        await self.transport.send(chat_id, screen.text)
-        for b in screen.buttons:
-            await self.transport.send(chat_id, f"[{b.label}] ::{b.callback_token}")
+        await self._send_screen(chat_id, screen)
 
-    async def handle_callback(self, chat_id: str, token: str) -> None:
+    async def handle_callback(
+        self, chat_id: str, token: str, callback_query_id: str | None = None
+    ) -> None:
         if self._wizard is None:
             await self.transport.send(chat_id, "Wizard no disponible.")
             return
@@ -179,15 +208,25 @@ class TelegramUXAdapter:
                 chat_id, "Acció no vàlida o expirada. Torna a obrir /xerrameca."
             )
             return
+        except _TelegramTransportError:
+            # Telegram API failed to deliver the screen; no internals exposed.
+            await self.transport.send(
+                chat_id, "S'ha produït un error inesperat. Torna a obrir /xerrameca."
+            )
+            return
         except Exception:
             # Unexpected: do not expose internals. Internal log only.
             await self.transport.send(
                 chat_id, "S'ha produït un error inesperat. Torna a obrir /xerrameca."
             )
             return
-        await self.transport.send(chat_id, screen.text)
-        for b in screen.buttons:
-            await self.transport.send(chat_id, f"[{b.label}] ::{b.callback_token}")
+        await self._send_screen(chat_id, screen)
+        if callback_query_id and self._transport_can_ack():
+            # ACK errors must never alter federated state.
+            try:
+                await self.transport.answer_callback_query(callback_query_id)
+            except _TelegramTransportError:
+                pass
 
     async def handle_wizard_text(self, chat_id: str, session_marker: str, text: str) -> bool:
         """Free-text input (objective / custom role). Returns True if handled."""
@@ -197,9 +236,7 @@ class TelegramUXAdapter:
         screen = self._wizard.handle_text(str(chat_id), session_id, text)
         if screen is None:
             return False
-        await self.transport.send(chat_id, screen.text)
-        for b in screen.buttons:
-            await self.transport.send(chat_id, f"[{b.label}] ::{b.callback_token}")
+        await self._send_screen(chat_id, screen)
         return True
 
     async def handle_text(self, chat_id: str, text: str) -> dict[str, Any] | None:
