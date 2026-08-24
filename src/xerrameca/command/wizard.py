@@ -36,6 +36,9 @@ WIZARD_STATES = (
     "CONFIRM",
     "STARTED",
     "CANCELLED",
+    "CONVERSATION_LIST",
+    "CONVERSATION_DETAIL",
+    "CONVERSATION_MODE",
 )
 
 ROOT_ACTIONS = (
@@ -46,7 +49,10 @@ ROOT_ACTIONS = (
 )
 
 VALID_TRANSITIONS: dict[str, tuple[str, ...]] = {
-    "ROOT": ("SELECT_PEER", "CANCELLED"),
+    "ROOT": ("SELECT_PEER", "CONVERSATION_LIST", "CANCELLED"),
+    "CONVERSATION_LIST": ("CONVERSATION_DETAIL", "ROOT", "CANCELLED"),
+    "CONVERSATION_DETAIL": ("CONVERSATION_MODE", "CONVERSATION_LIST", "CANCELLED"),
+    "CONVERSATION_MODE": ("CONVERSATION_DETAIL", "CANCELLED"),
     "SELECT_PEER": ("SELECT_DIALOGUE_TYPE", "ROOT", "CANCELLED"),
     "SELECT_DIALOGUE_TYPE": ("ENTER_OBJECTIVE", "SELECT_PEER", "CANCELLED"),
     "ENTER_OBJECTIVE": ("SELECT_ROLE_A", "SELECT_DIALOGUE_TYPE", "CANCELLED"),
@@ -67,10 +73,11 @@ class _SessionRecord:
 
 
 class XerramecaWizardService:
-    def __init__(self, state_dir: str, *, ttl_seconds: int = DEFAULT_TTL_SECONDS, node_port: int = 8891) -> None:
+    def __init__(self, state_dir: str, *, ttl_seconds: int = DEFAULT_TTL_SECONDS, node_port: int = 8891, command_service=None) -> None:
         self.state_dir = state_dir
         self.ttl_seconds = ttl_seconds
         self.node_port = node_port
+        self._cmd = command_service
         self._sessions: dict[str, _SessionRecord] = {}
         self._active_caller: dict[str, str] = {}
 
@@ -156,6 +163,12 @@ class XerramecaWizardService:
             return WizardScreen(state="STARTED",
                                 text=f"Conversa ja iniciada: {session.data.get('conversation_id', '')}",
                                 buttons=[])
+        if state == "CONVERSATION_LIST":
+            return self._conversation_list_screen(session)
+        if state == "CONVERSATION_DETAIL":
+            return self._conversation_detail_screen(session)
+        if state == "CONVERSATION_MODE":
+            return self._conversation_mode_screen(session)
         if state == "CANCELLED":
             return WizardScreen(state="CANCELLED", text="Wizard cancel·lat (sessió local, no federada).", buttons=[])
         return self.root_screen()
@@ -199,9 +212,18 @@ class XerramecaWizardService:
         if session.state == "ROOT":
             if action_id == "root:new":
                 return self._transition(session, "SELECT_PEER", self._peer_screen())
-            if action_id in ("root:conversations", "root:agents", "root:help"):
+            if action_id == "root:conversations":
+                return self._transition(session, "CONVERSATION_LIST", self._conversation_list_screen(session))
+            if action_id in ("root:agents", "root:help"):
                 return self.root_screen()
             raise WizardError("acció arrel no reconeguda")
+        # UX-4.1: conversation list / detail / mode
+        if session.state == "CONVERSATION_LIST" and action_id.startswith("conv:"):
+            return self._select_conversation(session, action_id)
+        if session.state == "CONVERSATION_DETAIL" and action_id.startswith("convdetail:"):
+            return self._detail_action(session, action_id)
+        if session.state == "CONVERSATION_MODE" and action_id.startswith("convmode:"):
+            return self._mode_action(session, action_id)
         # peer
         if session.state == "SELECT_PEER" and action_id.startswith("peer:"):
             return self._select_peer(session, action_id)
@@ -260,10 +282,161 @@ class XerramecaWizardService:
         )
         return buttons
 
+    # ----- UX-4.1: active conversations (local UI only) ---------------------
+    def _short_id(self, cid: str) -> str:
+        return cid[:8] + "…" if len(cid) > 8 else cid
+
+    def _conversation_list_screen(self, session: WizardSession) -> WizardScreen:
+        """Build the CONVERSATION_LIST screen from XerramecaCommandService.
+
+        The action_id only carries a short stable index (0..n), never the full
+        conversation id, node id, objective or secret. The index resolves to a
+        conversation id via session.data, so callbacks stay bounded and opaque.
+        """
+        from .service import XerramecaCommandService
+
+        try:
+            convos = self._command_service().list_conversations()
+        except Exception:
+            convos = []
+        mapping: dict[str, str] = {}   # short index -> conversation id
+        buttons: list[WizardButton] = []
+        for i, c in enumerate(convos):
+            mapping[str(i)] = c.id
+            label_parts = []
+            if c.status:
+                label_parts.append(c.status)
+            if c.max_rounds:
+                label_parts.append(f"ronda {c.current_round}/{c.max_rounds}")
+            label_parts.append(self._short_id(c.id))
+            buttons.append(WizardButton(label=" · ".join(label_parts), action_id=f"conv:{i}"))
+        # store the mapping snapshot for this session (stable within the session)
+        session.data["_conv_idx"] = mapping
+        if not buttons:
+            text = "No hi ha converses."
+        else:
+            text = "Converses:"
+        buttons.append(WizardButton(label="Enrere", action_id="nav:back"))
+        return WizardScreen(state="CONVERSATION_LIST", text=text, buttons=buttons)
+
+    def _select_conversation(self, session: WizardSession, action_id: str) -> WizardScreen:
+        idx = action_id.split(":", 1)[1] if ":" in action_id else ""
+        mapping = session.data.get("_conv_idx", {})
+        if idx not in mapping:
+            raise WizardError("conversa no reconeguda")
+        session.data["_active_conv"] = mapping[idx]
+        return self._transition(session, "CONVERSATION_DETAIL", self._conversation_detail_screen(session))
+
+    def _conversation_detail_screen(self, session: WizardSession) -> WizardScreen:
+        from .service import XerramecaCommandService
+
+        cid = session.data.get("_active_conv")
+        if not cid:
+            return WizardScreen(
+                state="CONVERSATION_DETAIL",
+                text="Conversa no trobada.",
+                buttons=[WizardButton(label="Enrere", action_id="nav:back")],
+            )
+        try:
+            view = self._command_service().get_conversation(cid)
+        except Exception:
+            view = None
+        if view is None:
+            return WizardScreen(
+                state="CONVERSATION_DETAIL",
+                text="Conversa no trobada o ja eliminada.",
+                buttons=[WizardButton(label="Enrere", action_id="nav:back")],
+            )
+        status = view.get("status", "unknown")
+        cr = view.get("current_round")
+        mr = view.get("max_rounds")
+        parts = []
+        parts.append(f"ID {self._short_id(cid)}")
+        parts.append(f"estat: {status}")
+        if cr is not None:
+            parts.append(f"ronda: {cr}/{mr if mr is not None else '-'}")
+        parts.append(f"peer: {self._peer_label(view)}")
+        cp = view.get("completion_pending")
+        if cp:
+            parts.append("completion: pendent")
+        lm = view.get("last_message")
+        if isinstance(lm, str) and lm:
+            parts.append(f"últim missatge: {lm[:60]}{'…' if len(lm) > 60 else ''}")
+        text = "\n".join(parts)
+        buttons = [
+            WizardButton(label="Actualitzar", action_id="convdetail:refresh"),
+            WizardButton(label="Sincronitzar", action_id="convdetail:sync"),
+            WizardButton(label="Mode", action_id="convdetail:mode"),
+            WizardButton(label="Enrere", action_id="nav:back"),
+        ]
+        return WizardScreen(state="CONVERSATION_DETAIL", text=text, buttons=buttons)
+
+    def _peer_label(self, view: dict) -> str:
+        parts = view.get("participants") or view.get("participant_node_ids") or []
+        if not parts:
+            return "n/d"
+        peer = parts[0]
+        return self._short_id(str(peer))
+
+    def _detail_action(self, session: WizardSession, action_id: str) -> WizardScreen:
+        action = action_id.split(":", 1)[1] if ":" in action_id else ""
+        cid = session.data.get("_active_conv")
+        from .service import XerramecaCommandService
+        svc = self._command_service()
+        if action == "refresh":
+            # read-only: rebuild the screen from the current view (no federation write)
+            return self._conversation_detail_screen(session)
+        if action == "sync":
+            if not cid:
+                return self._conversation_detail_screen(session)
+            try:
+                svc.sync_conversation(cid)
+            except Exception:
+                # peer unavailable / sync error -> controlled user-facing message
+                return WizardScreen(
+                    state="CONVERSATION_DETAIL",
+                    text="No s'ha pogut sincronitzar amb el peer. Torna-ho a provar.",
+                    buttons=[
+                        WizardButton(label="Torna-ho a provar", action_id="convdetail:refresh"),
+                        WizardButton(label="Mode", action_id="convdetail:mode"),
+                        WizardButton(label="Enrere", action_id="nav:back"),
+                    ],
+                )
+            return self._conversation_detail_screen(session)
+        if action == "mode":
+            return self._transition(session, "CONVERSATION_MODE", self._conversation_mode_screen(session))
+        raise WizardError(f"acció de detall no reconeguda: {action}")
+
+    def _conversation_mode_screen(self, session: WizardSession) -> WizardScreen:
+        cur = session.data.get("_conv_mode", "summary")
+        text = f"Mode local de la conversa: {cur}\n\n(Preferexncia d'interfície; no canvia el protocol federat.)"
+        buttons = [
+            WizardButton(label="Resum (summary)", action_id="convmode:summary"),
+            WizardButton(label="En directe (live)", action_id="convmode:live"),
+            WizardButton(label="Silenciós (silent)", action_id="convmode:silent"),
+            WizardButton(label="Enrere", action_id="nav:back"),
+        ]
+        return WizardScreen(state="CONVERSATION_MODE", text=text, buttons=buttons)
+
+    def _mode_action(self, session: WizardSession, action_id: str) -> WizardScreen:
+        mode = action_id.split(":", 1)[1] if ":" in action_id else ""
+        if mode not in ("summary", "live", "silent"):
+            raise WizardError("mode no reconegut")
+        # purely local UX preference stored on the session data; no federated event
+        session.data["_conv_mode"] = mode
+        return self._conversation_mode_screen(session)
+
+
+    def _command_service(self):
+        if self._cmd is not None:
+            return self._cmd
+        from .service import XerramecaCommandService
+        return XerramecaCommandService(self.state_dir, node_port=self.node_port)
+
     def _peer_screen(self) -> WizardScreen:
         from .service import XerramecaCommandService
 
-        agents = XerramecaCommandService(self.state_dir, node_port=self.node_port).list_agents()
+        agents = self._command_service().list_agents()
         buttons = [
             WizardButton(label=f"{a.display_name} ({'online' if a.online else ('unknown' if a.online is None else 'offline')})", action_id=f"peer:{a.node_id}")
             for a in agents
@@ -377,6 +550,13 @@ class XerramecaWizardService:
         return WizardScreen(state="CONFIRM", text=text, buttons=buttons)
 
     def _back(self, session: WizardSession) -> WizardScreen:
+        # UX-4.1 non-creation navigation: MODE -> DETAIL -> LIST -> ROOT
+        if session.state == "CONVERSATION_MODE":
+            return self._transition(session, "CONVERSATION_DETAIL", self._conversation_detail_screen(session))
+        if session.state == "CONVERSATION_DETAIL":
+            return self._transition(session, "CONVERSATION_LIST", self._conversation_list_screen(session))
+        if session.state == "CONVERSATION_LIST":
+            return self._transition(session, "ROOT", self.root_screen())
         order = WIZARD_STATES[: WIZARD_STATES.index("CONFIRM") + 1]
         idx = order.index(session.state)
         if idx <= 0:
