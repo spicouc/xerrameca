@@ -465,3 +465,95 @@ exercised without mutating the real XerramecaCommandService class or
 contaminating other test modules. 29 tests cover listing, detail, refresh,
 sync, mode, BACK, caller isolation, stale callbacks, and the public
 `adapter.handle_text("/xerrameca")` end-to-end path.
+
+
+## UX-4.2 — Telegram Bot API renderer (real inline keyboard)
+
+Adds an optional, real Telegram Bot API transport so a NeutralScreen is
+delivered as an actual `reply_markup.inline_keyboard` (1 button per row).
+
+### Render path
+
+    NeutralScreen / NeutralButton
+            ↓
+    TelegramUXAdapter._send_screen(chat_id, screen)
+            ↓
+    TelegramBotAPITransport.send_buttons(chat_id, text, buttons)
+            ↓
+    Telegram Bot API sendMessage
+            ↓
+    reply_markup.inline_keyboard (real)
+
+- No Telegram SDK. It uses the `httpx` dependency Xerrameca already ships
+  (no python-telegram-bot / aiogram / telebot; pyproject.toml is unchanged).
+- The transport is optional and injectable. If it is never instantiated the
+  federated core behaves exactly as before.
+
+### Capability detection / legacy fallback
+
+`TelegramUXAdapter._send_screen` detects whether the transport exposes
+`send_buttons`:
+
+- Transport with `send_buttons` → ONE sendMessage with inline_keyboard.
+- Send-only transport (older fakes / tests) → legacy text + `[label] ::token`
+  pseudo-button lines. This preserves UX-3, UX-3.1 and UX-4.1 tests unchanged
+  (UX-4.2 is additive).
+
+All three rendering paths (start_wizard, handle_callback, handle_wizard_text)
+route through the single `_send_screen` helper, so no path accidentally emits
+pseudo-buttons when a real keyboard is available.
+
+### Callback security & size
+
+- `callback_data` = the exact opaque `NeutralButton.callback_token` from
+  CallbackStore (the only source). No conversation_id, node_id, objective,
+  session JSON, API key, or bot token are ever placed inside it.
+- Telegram requires callback_data <= 64 bytes; the transport validates
+  `len(token.encode()) <= 64` before sending. Oversized tokens are rejected
+  with a controlled failure (never truncated, never replaced).
+
+### sendMessage payload
+
+    { "chat_id": ..., "text": screen_text,
+      "reply_markup": { "inline_keyboard": [ [ {text, callback_data} ] ] } }
+
+- One button per row; NeutralScreen button order is preserved.
+
+### bot token hygiene
+
+- The bot token is accepted at construction/runtime only.
+- It is never persisted, never written to SQLite, never stored in a wizard
+  session or callback, never logged, never included in a user-facing
+  exception, and avoided in object reprs.
+- The Bot API embeds the token in the request URL, so every httpx
+  HTTP/network failure is mapped to a generic `TelegramTransportError`
+  ("Telegram API request failed") raised `from None`, so the raw URL (with the
+  token) is never chained or surfaced.
+
+### Client injection & no real network
+
+- `TelegramBotAPITransport` accepts an optional `httpx.AsyncClient` and an
+  `api_base` override. Tests inject `httpx.MockTransport` + a fake base URL so
+  no test ever contacts `api.telegram.org`; there is zero real network in CI.
+
+### Callback ACK
+
+- `TelegramUXAdapter.handle_callback(chat_id, token, callback_query_id=None)`
+  is backward compatible. When `callback_query_id` is present and the transport
+  supports `answer_callback_query`, an ACK is sent (so Telegram stops the
+  inline spinner). ACK errors are swallowed (`from _TelegramTransportError`):
+  they never alter federated state and never introduce retry/background logic.
+
+### Error semantics
+
+- WizardError / CallbackError → existing generic message.
+- Telegram transport errors → generic message if still possible.
+- Never `f"{exc}"` to the user; never show the Bot API URL.
+
+### Explicitly NOT implemented here (UX-4.3 / UX-4.4)
+
+- polling / getUpdates loop
+- webhook server / update dispatcher
+- physical Telegram smoke
+- python-telegram-bot / aiogram / telebot
+- background workers
