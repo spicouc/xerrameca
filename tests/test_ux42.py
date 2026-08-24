@@ -1,8 +1,16 @@
 import asyncio
+import os
+import subprocess
+import sys
 import tempfile
+import time
+from pathlib import Path
 
 import httpx
 import pytest
+
+from xerrameca.node.identity import initialize_node, load_node_state
+from xerrameca.node.trust import accept_invite_over_http, create_invite
 
 from xerrameca.integrations.telegram_bot_api import (
     TelegramBotAPITransport,
@@ -95,6 +103,110 @@ def make_adapter(transport, cmd_store=None):
     adapter = TelegramUXAdapter(node_base_url="http://x", api_key="k",
                                 transport=transport, wizard=bridge)
     return adapter, callbacks, cmd
+
+
+SRC_DIR_PATH = Path(__file__).resolve().parents[1] / "src"
+
+
+# ---------------------------------------------------------------------------
+# Real trusted-peer nodes for the public-surface text-input flow (no Telegram
+# network: the adapter's transport is TelegramBotAPITransport over the fake).
+# ---------------------------------------------------------------------------
+def _start_node(sd, port):
+    p = subprocess.Popen(
+        [sys.executable, "-m", "xerrameca.cli", "node", "--state-dir", sd,
+         "--host", "127.0.0.1", "--port", str(port)],
+        env=dict(os.environ, PYTHONPATH=str(SRC_DIR_PATH)),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    for _ in range(60):
+        try:
+            if httpx.get(f"http://127.0.0.1:{port}/health", timeout=1.0).status_code == 200:
+                return p
+        except Exception:
+            time.sleep(0.2)
+    p.kill()
+    raise RuntimeError("node did not start")
+
+
+def _node_api_key(state_dir):
+    return open(load_node_state(state_dir).local_api_key_path).read().strip()
+
+
+@pytest.fixture
+def _peer_dir_42():
+    d = tempfile.mkdtemp(prefix="ux42_peer_")
+    initialize_node(d, agent_id="agent_peer", display_name="PeerAgent",
+                    endpoint="http://127.0.0.1:8932")
+    yield d
+
+
+@pytest.fixture
+def _state_dir_42():
+    d = tempfile.mkdtemp(prefix="ux42_state_")
+    initialize_node(d, agent_id="agent_test", display_name="TestAgent",
+                    endpoint="http://127.0.0.1:8931")
+    yield d
+
+
+@pytest.fixture
+async def ux42_flow(_state_dir_42, _peer_dir_42):
+    """Real trusted peers (real wizard state) + FakeTelegramAPI button transport.
+
+    Reuses the httpx.MockTransport zero-network fake for the Telegram side and
+    real nodes for the wizard's peer flow, so the whole public surface
+    (/xerrameca -> nova conversa -> peer -> preset -> objective) is exercised
+    through the real inline_keyboard transport.
+    """
+    state_dir, peer_dir = _state_dir_42, _peer_dir_42
+    pa = _start_node(state_dir, 8931)
+    pb = _start_node(peer_dir, 8932)
+    try:
+        t = create_invite(state_dir, ttl_seconds=600)
+        await accept_invite_over_http(peer_dir, t, timeout_seconds=10.0)
+        t2 = create_invite(peer_dir, ttl_seconds=600)
+        await accept_invite_over_http(state_dir, t2, timeout_seconds=10.0)
+        wizard = XerramecaWizardService(state_dir, ttl_seconds=60, node_port=8931)
+        callbacks = CallbackStore(ttl_seconds=60)
+        bridge = TelegramWizardBridge(wizard, callbacks)
+        tr, fake = make_transport()
+        adapter = TelegramUXAdapter(
+            node_base_url="http://127.0.0.1:8931", api_key=_node_api_key(state_dir),
+            transport=tr, wizard=bridge,
+        )
+        yield {"adapter": adapter, "transport": tr, "fake": fake,
+               "wizard": wizard, "bridge": bridge, "callbacks": callbacks}
+    finally:
+        pa.kill()
+        pb.kill()
+
+
+def last_keyboard(fake):
+    """(text, [(label, callback_data), ...]) of the last sendMessage."""
+    for path, p in reversed(fake.requests):
+        if "sendMessage" in path:
+            kb = p.get("reply_markup", {}).get("inline_keyboard", [])
+            return p["text"], [(r[0]["text"], r[0]["callback_data"]) for r in kb]
+    raise AssertionError("no sendMessage seen")
+
+
+async def click_keyboard(fake, adapter, chat, label_substr, cq=None):
+    """Click the button on the LAST rendered inline keyboard by label."""
+    _, kb = last_keyboard(fake)
+    match = [(t, c) for (t, c) in kb if label_substr in t]
+    if not match:
+        raise AssertionError(f"no button with {label_substr!r}; got {[t for t, _ in kb]}")
+    await adapter.handle_callback(chat, match[0][1], callback_query_id=cq)
+    return match[0][1]
+
+
+def assert_no_pseudo_lines(fake):
+    """ZERO pseudo '[label] ::token' text lines anywhere in sent messages."""
+    for path, p in fake.requests:
+        if "sendMessage" in path:
+            assert " ::" not in p.get("text", ""), p.get("text")
+            for r in p.get("reply_markup", {}).get("inline_keyboard", []):
+                assert " ::" not in r[0]["text"], r[0]["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -310,15 +422,65 @@ async def test_handle_callback_uses_button_transport():
 
 
 @pytest.mark.asyncio
-async def test_handle_wizard_text_uses_button_transport():
-    tr, fake = make_transport()
-    adapter, _, _ = make_adapter(tr)
-    # no expected_text_input on root, so direct text handling returns False
-    # but a screen with buttons still renders via button transport if any.
-    await adapter.start_wizard("c1")
-    # exercise handle_text path through the top-level handle_text('') no-op to
-    # confirm it still exists; the real text render is covered by start/callback
-    assert hasattr(adapter, "handle_wizard_text")
+async def test_handle_wizard_text_uses_button_transport(ux42_flow):
+    """Real text-input flow through the public surface.
+
+    /xerrameca -> Nova conversa -> peer -> preset -> ENTER_OBJECTIVE ->
+    adapter.handle_text(chat, 'objectiu real') -> SELECT_ROLE_A, all through
+    the real TelegramBotAPITransport inline_keyboard (FakeTelegramAPI)."""
+    f = ux42_flow
+    chat = "c1"
+    fake = f["fake"]
+    adapter = f["adapter"]
+
+    # -> ROOT via public handle_text
+    await adapter.handle_text(chat, "/xerrameca")
+    text, root_kb = last_keyboard(fake)
+    assert any("Nova conversa" in t for t, _ in root_kb)
+
+    # -> peer selection
+    await click_keyboard(fake, adapter, chat, "Nova conversa")
+    _, peer_kb = last_keyboard(fake)
+    assert any("PeerAgent" in t for t, _ in peer_kb), [t for t, _ in peer_kb]
+
+    # -> preset (dialogue type) -> ENTER_OBJECTIVE
+    await click_keyboard(fake, adapter, chat, "PeerAgent")
+    _, preset_kb = last_keyboard(fake)
+    assert any("Conversa" in t for t, _ in preset_kb), [t for t, _ in preset_kb]
+    await click_keyboard(fake, adapter, chat, "Conversa")
+
+    text_obj, obj_kb = last_keyboard(fake)
+    assert "Objectiu" in text_obj
+
+    # the text is genuinely consumed by the real public-surface handler.
+    # handle_text returns None for wizard-routed input by design; the proof of
+    # consumption is the newly rendered SELECT_ROLE_A screen and session state.
+    await adapter.handle_text(chat, "objectiu real")
+    next_text, next_kb = last_keyboard(fake)
+    # next screen: SELECT_ROLE_A rendered as a REAL inline keyboard
+    assert "inline_keyboard" in last_sendmsg(fake)["reply_markup"]
+    assert any("proposer" in t for t, _ in next_kb), [t for t, _ in next_kb]
+
+    # state actually advanced to SELECT_ROLE_A with the objective stored
+    sid = f["bridge"].active_session_id(chat)
+    sess = f["wizard"].get_session(sid, chat)
+    assert sess.state == "SELECT_ROLE_A"
+    assert sess.data["user_objective"] == "objectiu real"
+
+    # callback data opaque: no secret / conversation / node id in any payload
+    for path, p in fake.requests:
+        if "sendMessage" in path:
+            for r in p.get("reply_markup", {}).get("inline_keyboard", []):
+                cb = r[0]["callback_data"]
+                assert "conversation_id" not in cb and "node_" not in cb
+                assert "objectiu" not in cb and "TEST" not in cb
+                # callback_data must respect Telegram's 64-byte cap
+                assert len(cb.encode("utf-8")) <= 64
+
+    # ZERO pseudo-button lines anywhere
+    assert_no_pseudo_lines(fake)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -484,3 +646,81 @@ async def test_full_public_e2e_inline_keyboard():
             kb_ = p.get("reply_markup", {}).get("inline_keyboard", [])
             for r_ in kb_:
                 assert " ::" not in r_[0]["text"]
+# ---------------------------------------------------------------------------
+# TASK 2: ACK failure isolation (answerCallbackQuery failure never propagates
+# and never mutates federated state / runs duplicate work / leaks secrets).
+# ---------------------------------------------------------------------------
+class AckFailTransport:
+    """Button-capable transport whose ACK always fails."""
+
+    def __init__(self):
+        self.sent = []
+        self.ack_attempts = 0
+
+    async def send(self, chat_id, text):
+        self.sent.append((chat_id, text))
+
+    async def send_buttons(self, chat_id, text, buttons):
+        self.sent.append((chat_id, text, list(buttons)))
+
+    async def answer_callback_query(self, callback_query_id):
+        self.ack_attempts += 1
+        raise TelegramTransportError("Telegram API request failed")
+
+
+@pytest.mark.asyncio
+async def test_ack_failure_isolated():
+    """A callback ACK failure must be swallowed after the wizard action.
+
+    Sequence: button-capable transport whose answer_callback_query() raises
+    TelegramTransportError. Run a valid callback (Converses) with
+    callback_query_id='cq_fail'. The wizard action applies, the new screen is
+    sent, the ACK fails *after* processing, handle_callback does NOT raise,
+    wizard state stays in the new state (no rollback, no duplicate execution),
+    no federated mutation is caused by the ACK, and no secret/token leaks.
+    """
+    tr = AckFailTransport()
+    cmd_store = {"list": [_conv()], "get": None, "get_error": None, "sync_error": None}
+    adapter, callbacks, cmd = make_adapter(tr, cmd_store)
+
+    await adapter.start_wizard("c1")
+    assert len(tr.sent) == 1
+    # first screen sent via the real button transport (inline keyboard)
+    root_screen = tr.sent[0]
+    assert len(root_screen) == 3  # (chat_id, text, buttons) -> button-capable path
+
+    # find "Converses" callback token minted for this caller/session
+    conv_tok = next(b.callback_token for b in root_screen[2]
+                    if b.label == "Converses")
+    before_store = cmd.STORE["list"]
+
+    # The callback triggers ROOT -> CONVERSATION_LIST; the ACK will then fail.
+    await adapter.handle_callback("c1", conv_tok, callback_query_id="cq_fail")
+
+    # ACK was attempted after processing, and failed exactly once
+    assert tr.ack_attempts == 1
+
+    # new screen was sent (2nd message = the new CONVERSATION_LIST screen)
+    assert len(tr.sent) == 2, "wizard screen must be sent exactly once (no duplicate)"
+    screen2 = tr.sent[1]
+    assert len(screen2) == 3
+    texts = [b.label for b in screen2[2]]
+    assert any("RUNNING" in t for t in texts)
+
+    # wizard state remains in the NEW state -> no rollback, no exception,
+    # and handle_callback did NOT propagate the ACK failure
+    wizard = adapter._wizard.wizard
+    sid = adapter._wizard.active_session_id("c1")
+    sess = wizard.get_session(sid, "c1")
+    assert sess.state == "CONVERSATION_LIST"
+    assert sid == callbacks.resolve(conv_tok, caller_id="c1")[1]
+
+    # no duplicate / no new federated mutation from the ACK
+    assert cmd.STORE["list"] is before_store
+    assert [c.id for c in cmd.STORE["list"]] == [c.id for c in before_store]
+
+    # no secret / token leaked in any emitted message
+    for msg in tr.sent:
+        if len(msg) == 2:
+            assert "cq_fail" not in msg[1]
+            assert "TEST" not in msg[1]
