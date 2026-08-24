@@ -381,3 +381,87 @@ failover unchanged: YES
 Telegram external library dependency: NONE
 Pluribus dependency: NONE
 production nodes touched: NO
+
+
+## UX-4.1 — Active conversation UX (local UI, no federated changes)
+
+Implements a read-mostly "Converses" surface on top of the existing wizard
+stack. Telegram owns NO federated state; everything routes through
+XerramecaWizardService / XerramecaCommandService / node API.
+
+### Conversation list
+
+- Root → "Converses" opens a real list (no longer a placeholder), sourced from
+  XramaCommandService.list_conversations().
+- Each row shows a short human label: status, round (current/max), truncated id
+  (e.g. `RUNNING · ronda 3/6 · xfc_a72d…`).
+- Empty list renders "No hi ha converses." plus Enrere.
+
+### Conversation detail
+
+On selecting a conversation, shows only safe, user-facing fields:
+truncated id, status, current_round/max_rounds, peer (first participant),
+optional completion_pending and a summarized last_ message (<=60 chars).
+Never shows API keys, private keys, raw signatures, internal payloads, full
+event log, or local paths.
+
+### Refresh
+
+"Actualitzar" is read-only: re-fetches get_conversation() and rebuilds the
+screen. Creates no federated event, does not mutate status, no polling, no
+background task.
+
+### Sync
+
+"Sincronitzar" uses XerramecaCommandService.sync_conversation(). Errors from
+an unavailable peer are controlled and user-facing ("No s'ha pogut
+sincronitzar amb el peer. Torna-ho a provar.") with no raw exception leak.
+After sync the screen is rebuilt from the current state.
+
+### Local output mode
+
+Mode (summary / live / silent) is a local UI preference only, stored on the
+wizard session data (`_conv_mode`). It does NOT change the federated
+conversation or create any event. The dialog-type presets (mode:*) remain the
+federated dialogue type selection from the creation flow and are not confused
+with this local render mode.
+
+### BACK navigation
+
+- CONVERSATION_MODE → CONVERSATION_DETAIL
+- CONVERSATION_DETAIL → CONVERSATION_LIST
+- CONVERSATION_LIST → ROOT
+These are split off from the creation flow; BACK never rebuilds a creation
+session by accident.
+
+### Callback security
+
+Conversation callbacks use short bound indexes (conv:N) resolved via
+session.data["_conv_idx"]; the opaque token never contains conversation_id,
+node_id, objective, or secrets. Callbacks remain opaque, <=64 bytes,
+caller-bound, session-bound, TTL, and stored via CallbackStore.
+
+### Stale data handling
+
+Controlled, no traceback: conversation deleted/not-found, RUNNING->COMPLETED
+changes between screens, stale callback, callback from another caller, expired
+session, and sync with unavailable peer all resolve to a generic user-facing
+message via the existing WizardError / CallbackError boundary.
+
+### Not implemented here
+
+- No real Telegram InlineKeyboardMarkup / python-telegram-bot / aiogram / telebot
+  (that is UX-4.2).
+- No Stop / Pause / Continue / Cancel runtime / Retry / Force claim / Force
+  reply / manual takeover — the core does not expose a safe federated semantic
+  for those.
+- No polling and no background refresh tasks.
+
+### Test note
+
+tests/test_ux41.py injects a FakeCommandService into the wizard (dependency
+injection, wizard's optional `command_service=`) so the conversation surface is
+exercised without mutating the real XerramecaCommandService class or
+contaminating other test modules. 29 tests cover listing, detail, refresh,
+sync, mode, BACK, caller isolation, stale callbacks, and the public
+`adapter.handle_text("/xerrameca")` end-to-end path.
