@@ -7,6 +7,7 @@ import os
 import stat
 from collections.abc import Sequence
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -367,6 +368,29 @@ def _read_local_api_key(state_dir: str) -> str:
     return token
 
 
+def _node_port_from_url(node_base_url: str) -> int:
+    """Derive the node HTTP port from the --node-base-url.
+
+    The Telegram runtime must replay CommandService operations to the SAME
+    staging node it polls (--node-base-url). We require an explicit, valid
+    port; any missing/invalid/malformed port FAILS FAST rather than silently
+    falling back to the default 8891 (which would misroute staging writes at
+    production). Error stays sanitized (no URL, no token, no API key).
+    """
+    parts = urlsplit(node_base_url or "")
+    try:
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        # accessing parts.port raises for out-of-range/invalid ports
+        raise ValueError("el port del node base URL no és vàlid")
+    if hostname is None or port is None:
+        raise ValueError("no es pot determinar el port del node base URL")
+    if not (0 < port <= 65535):
+        raise ValueError("el port del node base URL no és vàlid")
+    return int(port)
+
+
 def _build_telegram_stack(args):
     """Build the full Telegram polling runtime from CLI args.
 
@@ -389,7 +413,8 @@ def _build_telegram_stack(args):
 
     state_dir = args.state_dir
     callbacks = CallbackStore()
-    wizard = XerramecaWizardService(state_dir)
+    node_port = _node_port_from_url(args.node_base_url)
+    wizard = XerramecaWizardService(state_dir, node_port=node_port)
     bridge = TelegramWizardBridge(wizard, callbacks)
     transport = TelegramBotAPITransport(token=token)
     adapter = TelegramUXAdapter(

@@ -118,6 +118,20 @@ class FakeCommandService:
         return {"id": cid, "status": "RUNNING", "current_round": 3,
                 "max_rounds": 6, "participants": ["peer1"]}
 
+    def create_conversation(self, peer_node_id, objective, max_rounds=5,
+                            delay_seconds=0):
+        self.create_count += 1
+        cid = f"xfc_ux44_{self.create_count}"
+        self.convos.append(
+            ConversationSummary(
+                id=cid, objective=objective, status="RUNNING", coordinator_id="c",
+                coordinator_epoch=0, current_round=1, max_rounds=max_rounds,
+                participants=[peer_node_id],
+            )
+        )
+        self.last_created = {"id": cid}
+        return {"id": cid}
+
 
 def _make_stack_with_adapter(fake, *, allowed=None):
     get_client, transport, fake = make_stack(fake)
@@ -1626,3 +1640,135 @@ async def test_batch_stops_before_offset_gap():
     # 100 consumed -> +1; 101 failed -> not consumed; 102 never dispatched.
     assert store.next_offset == 101
     assert d.seen == [100, 101]   # 102 NOT processed -> batch stopped
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UX-4.4B : node-port wiring fix (node_base_url -> wizard CommandService port)
+# -----------------------------------------------------------------------------
+# Regression for the INICIAR misroute. The Telegram runtime uses --node-base-url
+# (e.g. http://127.0.0.1:8991) but the wizard used to default node_port=8891,
+# misrouting create_conversation to production. After the fix the wizard derives
+# its CommandService port from the provided node_base_url (no silent 8891
+# fallback) and honours command_service injection.
+
+from xerrameca import cli
+from xerrameca.command.wizard import XerramecaWizardService
+
+
+def _wizard_fake():
+    """A minimal command_service double with contact counters."""
+    class _Fake:
+        def __init__(self):
+            self.create_count = 0
+            self.list_agents_count = 0
+            self.agents = []
+
+        def list_agents(self):
+            self.list_agents_count += 1
+            return self.agents
+
+        def create_conversation(self, peer_node_id, objective, max_rounds):
+            self.create_count += 1
+            return {"id": "conv-inj", "status": "active"}
+    return _Fake()
+
+
+# -- TEST CRITICAL 1 : 8991 propagation --------------------------------------
+def test_ux44b_node_port_derived_from_base_url():
+    assert cli._node_port_from_url("http://127.0.0.1:8991") == 8991
+
+
+# -- TEST CRITICAL 3 : no hardcoded port -------------------------------------
+def test_ux44b_alternate_port_not_hardcoded():
+    assert cli._node_port_from_url("http://127.0.0.1:9123") == 9123
+
+
+# -- TEST CRITICAL 2 : the CommandService that would run create_conversation
+#    targets the staging port (8991) NOT 8891 -------------------------------
+def test_ux44b_command_service_targets_node_port_not_8891():
+    w = XerramecaWizardService("x", node_port=8991)
+    svc = w._command_service()          # real XerramecaCommandService
+    # create_conversation posts to http://127.0.0.1:{node_port}/.../conversations
+    assert svc.node_port == 8991
+    assert svc.node_port != 8891
+
+
+# -- command_service injection (select peer + create conversation) ----------
+def test_ux44b_command_service_injection_honoured():
+    fake = _wizard_fake()
+    w = XerramecaWizardService("x", node_port=8991, command_service=fake)
+    # _command_service must return the injected fake (single source).
+    assert w._command_service() is fake
+    # create_conversation flows through the injected service.
+    s = w.create_session("caller")
+    s.state = "CONFIRM"
+    s.data = {"peer_node_id": "xn_p", "max_rounds": 2}
+    w.build_effective_objective = lambda sess: "obj"
+    w._start(s)
+    assert fake.create_count == 1
+    assert s.state == "STARTED"
+
+
+# -- idempotency : duplicate START does not create a second conversation -----
+def test_ux44b_start_idempotent_duplicate():
+    fake = _wizard_fake()
+    w = XerramecaWizardService("x", node_port=8991, command_service=fake)
+    s = w.create_session("caller")
+    s.state = "CONFIRM"
+    s.data = {"peer_node_id": "xn_p", "max_rounds": 2}
+    w.build_effective_objective = lambda sess: "obj"
+    w._start(s)
+    assert fake.create_count == 1
+    # second START: already STARTED -> idempotent, no extra create
+    w._start(s)
+    assert fake.create_count == 1
+    assert s.data["conversation_id"] == "conv-inj"
+
+
+# -- error handling : create failure leaves session NOT STARTED, no fake id --
+def test_ux44b_start_error_does_not_mark_started():
+    class _Boom:
+        def create_conversation(self, **kw):
+            raise RuntimeError("boom")
+        def list_agents(self):
+            return []
+    w = XerramecaWizardService("x", node_port=8991, command_service=_Boom())
+    s = w.create_session("caller")
+    s.state = "CONFIRM"
+    s.data = {"peer_node_id": "xn_p", "max_rounds": 2}
+    w.build_effective_objective = lambda sess: "obj"
+    import pytest as _p
+    with _p.raises(RuntimeError):
+        w._start(s)
+    assert s.state == "CONFIRM"
+    assert "conversation_id" not in s.data
+
+
+# -- TEST CRITICAL 4 : missing port -> FAIL-FAST, no 8891 fallback, no net ---
+def test_ux44b_base_url_missing_port_failfast():
+    import pytest as _p
+    with _p.raises(ValueError) as ei:
+        cli._node_port_from_url("http://127.0.0.1")     # no explicit port
+    msg = str(ei.value)
+    assert "port" in msg
+    assert "8891" not in msg
+
+
+# -- TEST CRITICAL 5 : malformed / invalid port -> FAIL-FAST, sanitized ------
+def test_ux44b_base_url_invalid_failfast_sanitized():
+    import pytest as _p
+    bad_inputs = ["not-a-url", "http://", "http://host:0",
+                  "http://127.0.0.1:99999", "http://127.0.0.1:abc"]
+    for bad in bad_inputs:
+        with _p.raises(ValueError) as ei:
+            cli._node_port_from_url(bad)
+        msg = str(ei.value)
+        # two acceptable fail-fast messages: missing/undeterminable port, or an
+        # explicitly invalid port. Both are sanitized.
+        assert ("no es pot determinar" in msg) or ("no és vàlid" in msg)
+        # sanitized: none of the offending input leaks, no secret markers
+        for frag in ("abc", "99999", "host:0", "not-a-url", "http://127.0.0.1:abc"):
+            assert frag not in msg
+        assert "token" not in msg.lower()
+        assert "api_key" not in msg.lower()
