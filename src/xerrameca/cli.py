@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import stat
 from collections.abc import Sequence
+from pathlib import Path
 
+import httpx
 import uvicorn
 
 from .config import settings
 from .dashboard import create_dashboard_app
+from .integrations.telegram_polling import TelegramPollingError
 from .node.app import create_node_app
 from .node.identity import initialize_node, load_node_state
 from .node.supervisor import LocalSupervisor
@@ -103,6 +108,37 @@ def _parser() -> argparse.ArgumentParser:
     conv_sync.add_argument("--state-dir", required=True)
     conv_sync.add_argument("conversation_id")
     conv_sync.add_argument("--json", dest="as_json", action="store_true")
+
+    telegram = sub.add_parser(
+        "telegram", help="run the Telegram long-polling runner (getUpdates)"
+    )
+    telegram.add_argument("--state-dir", required=True, help="durable node state dir")
+    telegram.add_argument(
+        "--node-base-url",
+        required=True,
+        help="explicit local node base URL, e.g. http://127.0.0.1:8791 "
+        "(no implicit default; required by design)",
+    )
+    telegram.add_argument(
+        "--token-file",
+        required=True,
+        help="path to the Telegram bot token file (NOT a --token argument; "
+        "the credential is never accepted or echo'd on the command line)",
+    )
+    telegram.add_argument(
+        "--allowed-chat-id",
+        action="append",
+        default=None,
+        metavar="ID",
+        help="telegram chat id allowed to act (repeatable). When omitted, every "
+        "chat may act (UX-4.3 allowlist policy is authoritative).",
+    )
+    telegram.add_argument(
+        "--poll-timeout",
+        type=int,
+        default=30,
+        help="positive long-poll timeout in seconds (default 30)",
+    )
 
     return parser
 
@@ -262,7 +298,135 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Replication: {result.get('replication_status','n/a')}")
         return 0
 
+    if args.command == "telegram":
+        asyncio.run(run_telegram_forever(args))
+        return 0
+
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+# ---------------------------------------------------------------------------
+# `xerrameca telegram` runtime helper (UX-4.4A)
+# ---------------------------------------------------------------------------
+_WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
+
+
+def _read_telegram_token(token_file: str) -> str:
+    """Read, strip and validate the bot token from ``--token-file``.
+
+    - Token CLI argument is PROHIBITED: credentials come only from a file.
+    - Insecure permissions (group/world writable) FAIL FAST with the sanitised
+      message ``"Telegram credential unavailable"`` (no path, no token).
+    - Empty / blank tokens are rejected. The token is kept only in memory and
+      is never persisted, logged, printed or stored.
+    """
+    path = Path(token_file)
+    try:
+        st = path.stat()
+    except OSError:
+        raise TelegramPollingError(
+            "Telegram credential unavailable", fatal=True
+        ) from None
+    if st.st_mode & _WRITE_BITS:
+        raise TelegramPollingError(
+            "Telegram credential unavailable", fatal=True
+        ) from None
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        raise TelegramPollingError(
+            "Telegram credential unavailable", fatal=True
+        ) from None
+    if not token:
+        raise TelegramPollingError(
+            "Telegram credential unavailable", fatal=True
+        ) from None
+    return token
+
+
+def _read_local_api_key(state_dir: str) -> str:
+    """Read the node-local API key from state-dir (runtime only).
+
+    NEVER generated, copied, printed or stored in any Telegram config; it is
+    read from the existing durable ``local-agent-api-key`` material so the
+    Telegram runtime can talk to the local node as an authorised agent.
+    """
+    from .node.identity import LOCAL_API_KEY_FILENAME
+
+    key_path = Path(state_dir) / LOCAL_API_KEY_FILENAME
+    try:
+        token = key_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        raise TelegramPollingError(
+            "Node credential unavailable", fatal=True
+        ) from None
+    if not token:
+        raise TelegramPollingError(
+            "Node credential unavailable", fatal=True
+        ) from None
+    return token
+
+
+def _build_telegram_stack(args):
+    """Build the full Telegram polling runtime from CLI args.
+
+    Returns (runner, dispatcher, client, offset_store). Wiring:
+    Token -> TelegramGetUpdatesClient; OffsetStore + Runner -> the rest.
+    """
+    from .command.wizard import XerramecaWizardService
+    from .integrations.telegram import TelegramUXAdapter
+    from .integrations.telegram_bot_api import TelegramBotAPITransport
+    from .integrations.telegram_polling import (
+        TelegramGetUpdatesClient,
+        TelegramOffsetStore,
+        TelegramPollingRunner,
+    )
+    from .integrations.telegram_updates import TelegramUpdateDispatcher
+    from .ui import CallbackStore, TelegramWizardBridge
+
+    token = _read_telegram_token(args.token_file)
+    api_key = _read_local_api_key(args.state_dir)
+
+    state_dir = args.state_dir
+    callbacks = CallbackStore()
+    wizard = XerramecaWizardService(state_dir)
+    bridge = TelegramWizardBridge(wizard, callbacks)
+    transport = TelegramBotAPITransport(token=token)
+    adapter = TelegramUXAdapter(
+        node_base_url=args.node_base_url,
+        api_key=api_key,
+        transport=transport,
+        wizard=bridge,
+    )
+    allowed = set(args.allowed_chat_id) if args.allowed_chat_id else None
+    dispatcher = TelegramUpdateDispatcher(adapter, allowed_chat_ids=allowed)
+    client = TelegramGetUpdatesClient(
+        token=token,
+        poll_timeout=args.poll_timeout,
+    )
+    offset_store = TelegramOffsetStore(state_dir)
+    runner = TelegramPollingRunner(
+        client=client,
+        dispatcher=dispatcher,
+        offset_store=offset_store,
+        state_dir=state_dir,
+    )
+    return runner, dispatcher, client, offset_store
+
+
+async def run_telegram_forever(args) -> int:
+    """Acquire the runner lock and poll until cancelled / fatal error.
+
+    Ctrl+C / asyncio cancel propagates cleanly; the exclusive lock is always
+    released via the runner's lifecycle (finally).
+    """
+    runner, dispatcher, client, offset_store = _build_telegram_stack(args)
+    runner.acquire_lock()
+    try:
+        await runner.run_forever()
+    finally:
+        runner.release_lock()
+    return 0
 
 
 if __name__ == "__main__":

@@ -618,3 +618,87 @@ objectiu (text) → role A → role B → rondes → sortida → INICIAR → con
 creada (exactament una vegada)`, then `/xerrameca → Converses → detall →
 Actualitzar → Mode → Enrere`. Plus duplicate-START and concurrent-START safety
 (`create_conversation` called exactly once).
+
+
+## UX-4.4A — Telegram long-polling runner (getUpdates)
+
+Completes the input chain: **getUpdates → TelegramPollingRunner →
+TelegramUpdateDispatcher → TelegramUXAdapter → Wizard/CommandService →
+TelegramBotAPITransport (sendMessage / InlineKeyboard / ACK)**.
+
+This is the LOCAL runner (v1.1 transport). It ONLY implements the runner:
+getUpdates long polling, poll lifecycle, durable offset management and
+delivery of each raw Update to the dispatcher. `TelegramUpdateDispatcher`
+(UX-4.3) remains the sole interpreter of message/callback semantics; the
+runner NEVER interprets callback_data / chat_id / message type.
+
+### Architecture
+
+- **TelegramGetUpdatesClient** — `httpx`-based `getUpdates`. Always sends
+  `allowed_updates=["message","callback_query"]`, a positive `timeout` poll
+  (default 30s) and an HTTP read timeout strictly greater than the poll
+  timeout (default poll*2+15). Supports an injectable `AsyncClient` and an
+  injectable `api_base` (programmatic/test only). Never exposes the token;
+  all exceptions are sanitized.
+- **TelegramPollingRunner** — `run_once()` (fetch one batch, deliver each
+  Update in Telegram order, advance offset) and `run_forever(stop_event)`
+  (bounded backoff on transient errors, resets backoff on success). Holds the
+  singleton `flock` runner lock for the state-dir. Supports `stop_event` and
+  clean `asyncio.CancelledError` propagation (never swallowed); frees the lock
+  in a `finally`.
+- **TelegramOffsetStore** — durable, atomic, monotonic offset at
+  `<state-dir>/telegram-offset.json` (`{"next_offset": <int>}`), perms 0600 /
+  state-dir 0700, written via temp-file + fsync + `os.replace()` (no `.tmp`
+  leftovers). Corrupt/missing-key/non-integer/negative → FAIL-FAST (no silent
+  reset to 0). Holds no token, chat ids, callbacks, objectives, conversation
+  ids or API keys.
+- **TelegramPollingError** — `fatal` flag: 401/403 (auth) and 409 (webhook
+  conflict / concurrent consumer) are fatal and stop the runner; network,
+  timeout, 5xx, 429 and invalid responses are transient (bounded backoff
+  1→2→4→8→16→30s, never a busy-loop).
+
+### Security
+
+- No `--token` CLI argument — only `--token-file PATH`. The token is read,
+  stripped, rejected if empty, kept in memory only, never printed/copied/
+  persisted. Empty or group/world-readable/writable token files FAIL-FAST with
+  sanitized "Telegram credential unavailable" (no path, no content).
+- The runtime reuses the existing `local-agent-api-key` from the state-dir
+  (read runtime-only; never generated/copied/printed or stored in Telegram
+  config).
+- No auto `deleteWebhook`, no silent bot-config mutation. On a 409/webhook
+  conflict the runner stops with sanitized "Telegram polling unavailable;
+  verify webhook configuration".
+- No error/log/exception/DispatchResult ever exposes the full URL with token,
+  raw response body, raw Telegram description, the token, or local filesystem
+  paths.
+
+### CLI
+
+`xerrameca telegram --state-dir <STATE_DIR> --node-base-url http://127.0.0.1:<PORT> --token-file <TOKEN_FILE> [--allowed-chat-id ID ...] [--poll-timeout 30]`
+
+- `--node-base-url` MUST be explicit (no implicit default to 8891) to reduce
+  the risk of accidentally pointing at production.
+- `--allowed-chat-id` is repeatable; each is converted to `str` and passed to
+  `TelegramUpdateDispatcher(allowed_chat_ids=...)`. No new allowlist policy is
+  implemented here (UX-4.3 policy is authoritative).
+
+### Delivery / offset semantics
+
+- **at-most-once** per `update_id` within one live dispatcher instance
+  (bounded process-local dedup). Durable offset + the dedup reduce replays.
+- **NO exactly-once guarantee**: a crash window exists between "dispatch
+  complete" and "offset persisted"; after a restart an Update that was
+  dispatched but not yet offset-confirmed may be received again. Documented,
+  not hidden. Persistence of getUpdates offset across restarts belongs to the
+  durable offset store, but replay after a crash is still possible and is
+  accepted.
+- Offset is monotonic (`next_offset = max(current, update_id + 1)`).
+
+### Out of scope (this stage)
+
+No webhook receiver, no polling daemon/background task inside FastAPI (the
+runner is invoked/owned externally, e.g. a `xerrameca telegram` process), no
+Telegram SDK, no new dependency, no physical Telegram traffic, no real bot
+token, no physical staging, no federation change, no protocol change.
+Physical / staged Telegram is still pending a later phase.
