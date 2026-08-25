@@ -448,9 +448,8 @@ class XerramecaWizardService:
 
     def _select_peer(self, session: WizardSession, action_id: str) -> WizardScreen:
         node_id = action_id.split(":", 1)[1]
-        from .service import XerramecaCommandService
 
-        agents = XerramecaCommandService(self.state_dir).list_agents()
+        agents = self._command_service().list_agents()
         if not any(a.node_id == node_id for a in agents):
             raise WizardError("peer no trusted o no seleccionable")
         session.data["peer_node_id"] = node_id
@@ -631,9 +630,8 @@ class XerramecaWizardService:
                                 buttons=[])
         if session.state != "CONFIRM":
             raise WizardError("només es pot iniciar des de CONFIRM")
-        from .service import XerramecaCommandService
 
-        result = XerramecaCommandService(self.state_dir, node_port=self.node_port).create_conversation(
+        result = self._command_service().create_conversation(
             peer_node_id=session.data["peer_node_id"],
             objective=self.build_effective_objective(session),
             max_rounds=int(session.data["max_rounds"]),

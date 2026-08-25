@@ -82,6 +82,20 @@ class FakeCommandService:
     def sync_conversation(self, cid):
         return {"ok": True}
 
+    def create_conversation(self, peer_node_id, objective, max_rounds=5,
+                            delay_seconds=0):
+        self.create_count += 1
+        cid = f"xfc_ux43_{self.create_count}"
+        self.convos.append(
+            ConversationSummary(
+                id=cid, objective=objective, status="RUNNING", coordinator_id="c",
+                coordinator_epoch=0, current_round=1, max_rounds=max_rounds,
+                participants=[peer_node_id],
+            )
+        )
+        self.last_created = {"id": cid}
+        return {"id": cid}
+
 
 def _make_real_stack(transport):
     """Adapter + wizard + bridge + dispatcher with a *real* wizard.
