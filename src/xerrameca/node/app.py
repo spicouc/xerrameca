@@ -247,6 +247,40 @@ def create_node_app(state_dir: str) -> FastAPI:
             summaries = summaries[:limit]
         return {"conversations": summaries, "count": len(summaries)}
 
+    @app.get(
+        "/v1/node/federation/inbox",
+        tags=["federated-dialogue"],
+    )
+    async def federated_inbox(request: Request) -> dict[str, Any]:
+        """Local federated inbox: turns waiting for THIS node, read-only.
+
+        Returns only turns that are currently actionable by the local node:
+          - conversation.status == active
+          - current_turn is present
+          - current_turn.assigned_node_id == local node
+          - current_turn.available_at <= now
+
+        Does NOT claim, does NOT mutate state, does NOT append events.
+        The autonomous worker polls this endpoint and performs claim+reply itself.
+        """
+        await authenticate_local_agent(request)
+        turns: list[dict[str, Any]] = []
+        for view in dialogue.pending_turns():
+            turn = view.current_turn or {}
+            turns.append(
+                {
+                    "conversation_id": view.id,
+                    "name": view.name,
+                    "objective": view.objective,
+                    "round": turn.get("round"),
+                    "max_rounds": view.max_rounds,
+                    "phase": turn.get("phase"),
+                    "turn_id": turn.get("turn_id"),
+                    "messages": view.messages,
+                }
+            )
+        return {"turns": turns, "count": len(turns)}
+
     @app.post(
         "/v1/node/federation/conversations/{conversation_id}/claim",
         tags=["federated-dialogue"],

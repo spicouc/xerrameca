@@ -182,6 +182,36 @@ class FederatedDialogueService:
         """List all local federated conversation ids (reconstructed from events)."""
         return self.store.list_conversation_ids()
 
+    def pending_turns(self, now: int | None = None) -> list[FederatedConversationView]:
+        """Return conversations whose current turn is assignable to THIS node now.
+
+        Read-only: never claims, never mutates state, never appends events.
+        A turn is "pending for the local node" when:
+          - conversation is active
+          - a current_turn exists
+          - current_turn.assigned_node_id == this node's id
+          - current_turn.available_at <= now (no future/leased-out turn)
+          - not already claimed by another node (claimed_by_node_id is None
+            or equals this node — defensive against stale lease views)
+        """
+        if now is None:
+            now = int(time.time())
+        pending: list[FederatedConversationView] = []
+        for cid in self.store.list_conversation_ids():
+            view = self._view(cid)
+            turn = view.current_turn
+            if view.status != "active" or turn is None:
+                continue
+            if turn.get("assigned_node_id") != self.state.node_id:
+                continue
+            if int(turn.get("available_at") or 0) > now:
+                continue
+            claimed = turn.get("claimed_by_node_id")
+            if claimed is not None and claimed != self.state.node_id:
+                continue
+            pending.append(view)
+        return pending
+
     def _participant(self, peer: PeerRecord) -> dict[str, str]:
         return {
             "node_id": peer.node_id,
