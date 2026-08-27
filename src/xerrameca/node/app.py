@@ -247,6 +247,62 @@ def create_node_app(state_dir: str) -> FastAPI:
             summaries = summaries[:limit]
         return {"conversations": summaries, "count": len(summaries)}
 
+    @app.get(
+        "/v1/node/federation/inbox",
+        tags=["federated-dialogue"],
+    )
+    async def federated_inbox(request: Request) -> dict[str, Any]:
+        """Local federated inbox: turns waiting for THIS node, read-only.
+
+        Returns only turns that are currently actionable by the local node:
+          - conversation.status == active
+          - current_turn is present
+          - current_turn.assigned_node_id == local node
+          - current_turn.available_at <= now
+
+        Does NOT claim, does NOT mutate state, does NOT append events.
+        The autonomous worker polls this endpoint and performs claim+reply itself.
+
+        Ordering is deterministic: available_at ASC, then conversation_id ASC
+        (stable for the UX-5.2 worker).
+        """
+        await authenticate_local_agent(request)
+        views = dialogue.pending_turns()
+        # Deterministic ordering: available_at ASC, conversation_id ASC.
+        views.sort(
+            key=lambda v: (
+                int((v.current_turn or {}).get("available_at") or 0),
+                v.id,
+            )
+        )
+        turns: list[dict[str, Any]] = []
+        for view in views:
+            turn = view.current_turn or {}
+            turns.append(
+                {
+                    "conversation_id": view.id,
+                    "name": view.name,
+                    "objective": view.objective,
+                    # dialogue_type is NOT carried by the federated core/protocol
+                    # (it only lives in the legacy Telegram wizard session). Reporting
+                    # it here would require a protocol/schema change, which is out of
+                    # scope for UX-5.1. See TurnContext audit (UNAVAILABLE).
+                    "dialogue_type": None,
+                    "status": view.status,
+                    "round": turn.get("round"),
+                    "max_rounds": view.max_rounds,
+                    "turn_id": turn.get("turn_id"),
+                    "slot": turn.get("slot"),
+                    "phase": turn.get("phase"),
+                    "assigned_node_id": turn.get("assigned_node_id"),
+                    "available_at": turn.get("available_at"),
+                    "claimed_by_node_id": turn.get("claimed_by_node_id"),
+                    "completion_pending": view.completion_proposal is not None,
+                    "messages": view.messages,
+                }
+            )
+        return {"turns": turns, "count": len(turns)}
+
     @app.post(
         "/v1/node/federation/conversations/{conversation_id}/claim",
         tags=["federated-dialogue"],
