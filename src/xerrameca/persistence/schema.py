@@ -143,4 +143,35 @@ CREATE TABLE IF NOT EXISTS summary_outbox (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- UX-5.2 A++ task queue (ephemeral transport persistence)
+CREATE TABLE IF NOT EXISTS task_queue (
+    task_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    agent_id TEXT,
+    conversation_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    epoch INTEGER NOT NULL,
+    objective TEXT NOT NULL,
+    roles_json TEXT NOT NULL,
+    history_ref TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','leased','failed','discarded','done')),
+    lease_owner TEXT,
+    lease_expires_at REAL,
+    claim_token TEXT,
+    response_payload TEXT,
+    response_status TEXT NOT NULL DEFAULT 'none'
+        CHECK (response_status IN ('none','submitted','applied','rejected')),
+    last_error TEXT,
+    discard_reason TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    available_after TEXT NOT NULL DEFAULT (datetime('now')),
+    retries INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3
+);
+CREATE INDEX IF NOT EXISTS idx_task_queue_agent_status ON task_queue(agent_id, status, available_after, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_queue_conversation_turn ON task_queue(conversation_id, turn_id);
 """
